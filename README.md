@@ -32,3 +32,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "gtk-theme" / "python"))
 import gtk_theme
 ```
+
+## License
+
+GNU General Public License v3.0. See [LICENSE](LICENSE).

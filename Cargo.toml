@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Kevin Hinds"]
 description = "Shared color profiles and Adwaita icon helpers for the GTK4 apps suite"
-license = "GPL-3.0-or-later"
+license = "GPL-3.0"
 
 [dependencies]
 gtk4 = { version = "0.9", features = ["v4_10"] }
