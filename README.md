@@ -1,10 +1,10 @@
 # gtk-theme
 
-Shared color profiles and UI chrome for the Neuronix GTK-Apps suite (Rust crate + Python helpers).
+Shared color profiles and UI chrome for the hyprCore Linux GTK apps (Rust crate + Python helpers).
 
 Provides built-in and custom profiles, the suite **Profile** / About menu, Adwaita icon helpers, and theming utilities used by every `gtk-*` app.
 
-Created by Kevin Hinds — [github.com/NeuronixOS/GTK-Apps](https://github.com/NeuronixOS/GTK-Apps)
+Created by Kevin Hinds
 
 ## Layout
 
@@ -12,9 +12,9 @@ Created by Kevin Hinds — [github.com/NeuronixOS/GTK-Apps](https://github.com/N
 |------|------|
 | `src/` | Rust library (`gtk-theme`) |
 | `python/gtk_theme.py` | Python helpers for GTK4 apps |
-| `profiles.json` | Built-in color profiles (**Neuronix** first, plus well-known themes) |
+| `profiles.json` | Built-in color profiles (**hyprCore Linux** first, plus well-known themes) |
 
-Active profile selection lives in `~/.config/gtk-apps/theme.toml`; chrome overrides for Neuronix (and any user-saved customs) live in `~/.config/gtk-apps/custom-profiles.json`.
+Active profile selection lives in `~/.config/gtk-apps/theme.toml`; chrome overrides for hyprCore Linux (and any user-saved customs) live in `~/.config/gtk-apps/custom-profiles.json`.
 
 ## Use from Rust
 
