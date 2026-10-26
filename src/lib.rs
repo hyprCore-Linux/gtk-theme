@@ -1,0 +1,4526 @@
+//! Shared color profiles for the GTK4 apps suite.
+//!
+//! Profiles (Gruvbox Dark by default, plus Tokyo Night, Dracula, Nord, …)
+//! are selected from each app's options/menu and persisted in
+//! `~/.config/gtk-apps/theme.toml` so the suite stays visually consistent.
+//!
+//! Also provides Adwaita icon helpers ([`icons`]) for labeled buttons and
+//! menu rows. Runtime icons come from the system `adwaita-icon-theme` package.
+
+mod icons;
+
+pub use icons::{
+    app_icons, ensure_adwaita_icons, icon_button, icon_for_action, icon_for_label, icon_label_box,
+    labeled_button, strip_mnemonic, symbolic_image, IconMenu, MenuIconEntry,
+    RUNTIME_ICON_THEME_PACKAGE, SYMBOLIC_PIXEL_SIZE,
+};
+
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+use gtk::gdk;
+use gtk::gio;
+use gtk::gio::prelude::*;
+use gtk::glib;
+use gtk::prelude::*;
+use gtk4 as gtk;
+use serde::{Deserialize, Serialize};
+
+/// A named, built-in color scheme.
+#[derive(Debug, Clone, Copy)]
+pub struct Profile {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub foreground: &'static str,
+    pub background: &'static str,
+    pub palette: [&'static str; 16],
+}
+
+impl Profile {
+    pub fn foreground_rgba(&self) -> gdk::RGBA {
+        parse_color(self.foreground, "#ebdbb2")
+    }
+
+    pub fn background_rgba(&self) -> gdk::RGBA {
+        parse_color(self.background, "#282828")
+    }
+
+    pub fn palette_rgba(&self) -> Vec<gdk::RGBA> {
+        self.palette
+            .iter()
+            .map(|c| parse_color(c, "#000000"))
+            .collect()
+    }
+
+    /// True when the background is dark (drives chrome contrast).
+    pub fn is_dark(&self) -> bool {
+        relative_luminance(self.background) < 0.45
+    }
+
+    /// Elevated surface for header bars / toolbars / side panels.
+    pub fn surface_hex(&self) -> String {
+        // Blend a little foreground into the background so bars are distinct
+        // from the window, without relying on ANSI slot 0 (often == bg).
+        mix_hex(self.background, self.foreground, 0.10)
+    }
+
+    /// Stronger elevation for selected tabs / hover panels.
+    pub fn surface_alt_hex(&self) -> String {
+        mix_hex(self.background, self.foreground, 0.18)
+    }
+
+    /// Hyprland focused outline — two-stop gradient. Custom profiles may set
+    /// this; built-ins mix surface_alt toward foreground.
+    pub fn border_active_stops(&self) -> [String; 2] {
+        if let Some(pair) = custom_profile_data(self.id).and_then(|d| d.active_border_stops()) {
+            return pair;
+        }
+        let a = self.surface_alt_hex();
+        let b = mix_hex(&a, self.foreground, 0.35);
+        [a, b]
+    }
+
+    /// Hyprland unfocused outline — two-stop gradient. Built-ins mix surface
+    /// toward background.
+    pub fn border_inactive_stops(&self) -> [String; 2] {
+        if let Some(pair) = custom_profile_data(self.id).and_then(|d| d.inactive_border_stops()) {
+            return pair;
+        }
+        let a = self.surface_hex();
+        let b = mix_hex(&a, self.background, 0.40);
+        [a, b]
+    }
+
+    /// First active stop (legacy single-color callers).
+    pub fn border_hex(&self) -> String {
+        self.border_active_stops()[0].clone()
+    }
+
+    pub fn hypr_active_border(&self) -> Option<String> {
+        let [a, b] = self.border_active_stops();
+        hypr_gradient(&a, &b, self.window_chrome().gradient)
+    }
+
+    pub fn hypr_inactive_border(&self) -> Option<String> {
+        let [a, b] = self.border_inactive_stops();
+        hypr_gradient(&a, &b, self.window_chrome().gradient)
+    }
+
+    /// Thickness / rounding / hyprbars glyphs. Built-ins use stock defaults;
+    /// custom profiles may override via `chrome` in custom-profiles.json.
+    pub fn window_chrome(&self) -> WindowChrome {
+        custom_profile_data(self.id)
+            .map(|d| d.chrome_or_default())
+            .unwrap_or_default()
+    }
+
+    /// Suite accent — ANSI blue slot (palette[4]). Drives Adwaita
+    /// `--accent-blue` / `blue_3`, file selection, and text highlights.
+    pub fn accent(&self) -> &'static str {
+        self.palette[4]
+    }
+}
+
+/// Owned, editable form of a [`Profile`] — used by the theme editor and for
+/// user "custom" profiles persisted to `~/.config/gtk-apps/custom-profiles.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileData {
+    pub id: String,
+    pub name: String,
+    pub foreground: String,
+    pub background: String,
+    pub palette: Vec<String>,
+    /// Legacy single Hyprland outline (migrated to `border_active[0]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border: Option<String>,
+    /// Focused window outline — two `#rrggbb` stops (Hyprland gradient).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border_active: Option<Vec<String>>,
+    /// Unfocused window outline — two `#rrggbb` stops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub border_inactive: Option<Vec<String>>,
+    /// Thickness, rounding, and hyprbars − □ × glyphs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome: Option<WindowChrome>,
+}
+
+/// Hyprbars glyph kits: (id, menu label, minimize, maximize, close).
+pub const BUTTON_KITS: &[(&str, &str, &str, &str, &str)] = &[
+    ("gnome", "GNOME − □ ×", "−", "□", "×"),
+    ("macos", "macOS ● ● ●", "●", "●", "●"),
+    ("nerd", "Nerd 󰖰 󰖯 󰖭", "󰖰", "󰖯", "󰖭"),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ChromeBevel {
+    #[default]
+    Flat,
+    Inner,
+    Double,
+}
+
+impl ChromeBevel {
+    pub fn as_id(self) -> &'static str {
+        match self {
+            Self::Flat => "flat",
+            Self::Inner => "inner",
+            Self::Double => "double",
+        }
+    }
+
+    pub fn from_id(s: &str) -> Self {
+        match s {
+            "inner" => Self::Inner,
+            "double" => Self::Double,
+            _ => Self::Flat,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Flat => "Flat",
+            Self::Inner => "Inner highlight",
+            Self::Double => "Double ring",
+        }
+    }
+}
+
+/// Horizontal two-stop gradient for Hyprland outlines and hyprbars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ChromeGradient {
+    Ltr,
+    #[default]
+    Rtl,
+}
+
+impl ChromeGradient {
+    pub fn as_id(self) -> &'static str {
+        match self {
+            Self::Ltr => "ltr",
+            Self::Rtl => "rtl",
+        }
+    }
+
+    pub fn from_id(s: &str) -> Self {
+        match s {
+            "rtl" | "right_left" | "right-to-left" => Self::Rtl,
+            _ => Self::Ltr,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ltr => "Left → Right",
+            Self::Rtl => "Right → Left",
+        }
+    }
+
+    pub fn is_rtl(self) -> bool {
+        matches!(self, Self::Rtl)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChromeButtons {
+    #[serde(default = "default_button_size")]
+    pub size: u32,
+    #[serde(default = "default_button_kit")]
+    pub kit: String,
+    #[serde(default = "default_minimize")]
+    pub minimize: String,
+    #[serde(default = "default_maximize")]
+    pub maximize: String,
+    #[serde(default = "default_close")]
+    pub close: String,
+}
+
+fn default_button_size() -> u32 {
+    18
+}
+fn default_button_kit() -> String {
+    "gnome".to_string()
+}
+fn default_minimize() -> String {
+    "−".to_string()
+}
+fn default_maximize() -> String {
+    "□".to_string()
+}
+fn default_close() -> String {
+    "×".to_string()
+}
+
+impl Default for ChromeButtons {
+    fn default() -> Self {
+        Self {
+            size: default_button_size(),
+            kit: default_button_kit(),
+            minimize: default_minimize(),
+            maximize: default_maximize(),
+            close: default_close(),
+        }
+    }
+}
+
+impl ChromeButtons {
+    pub fn apply_kit(&mut self, kit: &str) {
+        let (_, _, min, max, close) = BUTTON_KITS
+            .iter()
+            .copied()
+            .find(|(id, _, _, _, _)| *id == kit)
+            .unwrap_or(BUTTON_KITS[0]);
+        self.kit = kit.to_string();
+        self.minimize = min.to_string();
+        self.maximize = max.to_string();
+        self.close = close.to_string();
+    }
+
+    fn glyph_for_action(&self, action: &str) -> &str {
+        let lower = action.to_ascii_lowercase();
+        if lower.contains("killactive") || lower.contains("closewindow") {
+            &self.close
+        } else if lower.contains("fullscreen") {
+            &self.maximize
+        } else {
+            &self.minimize
+        }
+    }
+}
+
+/// Window outline geometry + titlebar buttons stored on a suite profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowChrome {
+    #[serde(default = "default_border_size")]
+    pub border_size: u32,
+    #[serde(default = "default_rounding")]
+    pub rounding: u32,
+    #[serde(default)]
+    pub bevel: ChromeBevel,
+    /// Left→right or right→left — used for `col.active_border` / inactive and hyprbars.
+    #[serde(default)]
+    pub gradient: ChromeGradient,
+    /// Hyprbars focused title-bar fill — two `#rrggbb` stops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bar: Option<Vec<String>>,
+    /// Hyprbars unfocused title-bar fill — two `#rrggbb` stops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bar_inactive: Option<Vec<String>>,
+    #[serde(default)]
+    pub buttons: ChromeButtons,
+}
+
+fn default_border_size() -> u32 {
+    3
+}
+fn default_rounding() -> u32 {
+    8
+}
+
+impl Default for WindowChrome {
+    fn default() -> Self {
+        Self {
+            border_size: default_border_size(),
+            rounding: default_rounding(),
+            bevel: ChromeBevel::Flat,
+            gradient: ChromeGradient::Rtl,
+            bar: None,
+            bar_inactive: None,
+            buttons: ChromeButtons::default(),
+        }
+    }
+}
+
+impl WindowChrome {
+    pub fn clamp(&mut self) {
+        self.border_size = self.border_size.clamp(0, 20);
+        self.rounding = self.rounding.min(20);
+        self.buttons.size = self.buttons.size.clamp(10, 36);
+        if self.buttons.minimize.trim().is_empty() {
+            self.buttons.minimize = default_minimize();
+        }
+        if self.buttons.maximize.trim().is_empty() {
+            self.buttons.maximize = default_maximize();
+        }
+        if self.buttons.close.trim().is_empty() {
+            self.buttons.close = default_close();
+        }
+    }
+
+    /// Title-bar gradient stops, falling back to elevated surface → mix toward fg.
+    pub fn bar_stops(&self, surface: &str, fg: &str) -> [String; 2] {
+        let a = ProfileData::valid_hex(surface).unwrap_or_else(|| surface.to_string());
+        let b = mix_hex(&a, fg, 0.22);
+        ProfileData::pair_from(self.bar.as_ref(), [a, b])
+    }
+
+    /// Unfocused title-bar stops, falling back to a darker mix toward the background.
+    pub fn bar_inactive_stops(&self, surface: &str, bg: &str) -> [String; 2] {
+        let a = ProfileData::valid_hex(surface).unwrap_or_else(|| surface.to_string());
+        let b = mix_hex(&a, bg, 0.40);
+        ProfileData::pair_from(self.bar_inactive.as_ref(), [a, b])
+    }
+}
+
+impl ProfileData {
+    /// Snapshot of a static [`Profile`] as owned, editable data.
+    pub fn from_profile(p: &Profile) -> Self {
+        Self {
+            id: p.id.to_string(),
+            name: p.name.to_string(),
+            foreground: p.foreground.to_string(),
+            background: p.background.to_string(),
+            palette: p.palette.iter().map(|c| c.to_string()).collect(),
+            border: Some(p.border_hex()),
+            border_active: Some(p.border_active_stops().to_vec()),
+            border_inactive: Some(p.border_inactive_stops().to_vec()),
+            chrome: Some(p.window_chrome()),
+        }
+    }
+
+    /// Fill missing window-border stops so the editor always has four hexes.
+    pub fn seed_window_borders(&mut self) {
+        let active = self.active_border_stops().unwrap_or_else(|| {
+            let a = self.border_hex();
+            [a.clone(), a]
+        });
+        let inactive = self.inactive_border_stops().unwrap_or_else(|| {
+            let a = mix_hex(&self.background, &self.foreground, 0.10);
+            let b = mix_hex(&a, &self.background, 0.40);
+            [a, b]
+        });
+        self.border_active = Some(active.to_vec());
+        self.border_inactive = Some(inactive.to_vec());
+        self.border = Some(active[0].clone());
+        self.seed_chrome();
+    }
+
+    pub fn seed_chrome(&mut self) {
+        let mut chrome = self.chrome.clone().unwrap_or_default();
+        chrome.clamp();
+        if chrome.bar.is_none() {
+            let surface = mix_hex(&self.background, &self.foreground, 0.10);
+            chrome.bar = Some(chrome.bar_stops(&surface, &self.foreground).to_vec());
+        }
+        if chrome.bar_inactive.is_none() {
+            let surface = mix_hex(&self.background, &self.foreground, 0.08);
+            chrome.bar_inactive = Some(
+                chrome
+                    .bar_inactive_stops(&surface, &self.background)
+                    .to_vec(),
+            );
+        }
+        self.chrome = Some(chrome);
+    }
+
+    pub fn chrome_or_default(&self) -> WindowChrome {
+        let mut chrome = self.chrome.clone().unwrap_or_default();
+        chrome.clamp();
+        chrome
+    }
+
+    pub fn chrome_mut(&mut self) -> &mut WindowChrome {
+        self.chrome.get_or_insert_with(WindowChrome::default)
+    }
+
+    fn valid_hex(s: &str) -> Option<String> {
+        let t = s.trim();
+        hex_digits(t)?;
+        if t.starts_with('#') {
+            Some(t.to_ascii_lowercase())
+        } else {
+            Some(format!("#{t}").to_ascii_lowercase())
+        }
+    }
+
+    fn pair_from(raw: Option<&Vec<String>>, fallback: [String; 2]) -> [String; 2] {
+        let mut out = fallback;
+        if let Some(v) = raw {
+            if let Some(a) = v.first().and_then(|s| Self::valid_hex(s)) {
+                out[0] = a.clone();
+                out[1] = v.get(1).and_then(|s| Self::valid_hex(s)).unwrap_or(a);
+            }
+        }
+        out
+    }
+
+    /// Focused gradient stops, or `None` if this profile never set them.
+    pub fn active_border_stops(&self) -> Option<[String; 2]> {
+        let fallback = mix_hex(&self.background, &self.foreground, 0.18);
+        if let Some(v) = &self.border_active {
+            if v.iter().any(|s| Self::valid_hex(s).is_some()) {
+                return Some(Self::pair_from(Some(v), [fallback.clone(), fallback]));
+            }
+        }
+        if let Some(one) = self.border.as_deref().and_then(Self::valid_hex) {
+            return Some([one.clone(), one]);
+        }
+        None
+    }
+
+    pub fn inactive_border_stops(&self) -> Option<[String; 2]> {
+        let v = self.border_inactive.as_ref()?;
+        if !v.iter().any(|s| Self::valid_hex(s).is_some()) {
+            return None;
+        }
+        let a = mix_hex(&self.background, &self.foreground, 0.10);
+        let b = mix_hex(&a, &self.background, 0.40);
+        Some(Self::pair_from(Some(v), [a, b]))
+    }
+
+    /// Hyprland window outline — first active stop (legacy).
+    pub fn border_hex(&self) -> String {
+        if let Some(pair) = self.active_border_stops() {
+            return pair[0].clone();
+        }
+        mix_hex(&self.background, &self.foreground, 0.18)
+    }
+
+    pub fn set_active_border_stop(&mut self, i: usize, hex: String) {
+        let mut pair = self
+            .active_border_stops()
+            .unwrap_or_else(|| [self.border_hex(), self.border_hex()]);
+        pair[i.min(1)] = hex;
+        self.border_active = Some(pair.to_vec());
+        self.border = Some(pair[0].clone());
+    }
+
+    pub fn set_inactive_border_stop(&mut self, i: usize, hex: String) {
+        let a = mix_hex(&self.background, &self.foreground, 0.10);
+        let b = mix_hex(&a, &self.background, 0.40);
+        let mut pair = self.inactive_border_stops().unwrap_or([a, b]);
+        pair[i.min(1)] = hex;
+        self.border_inactive = Some(pair.to_vec());
+    }
+
+    pub fn set_bar_stop(&mut self, i: usize, hex: String) {
+        let surface = mix_hex(&self.background, &self.foreground, 0.10);
+        let mut pair = self
+            .chrome_or_default()
+            .bar_stops(&surface, &self.foreground);
+        pair[i.min(1)] = hex;
+        self.chrome_mut().bar = Some(pair.to_vec());
+    }
+
+    pub fn set_bar_inactive_stop(&mut self, i: usize, hex: String) {
+        let surface = mix_hex(&self.background, &self.foreground, 0.08);
+        let mut pair = self
+            .chrome_or_default()
+            .bar_inactive_stops(&surface, &self.background);
+        pair[i.min(1)] = hex;
+        self.chrome_mut().bar_inactive = Some(pair.to_vec());
+    }
+
+    pub fn hypr_active_border(&self) -> Option<String> {
+        let [a, b] = self
+            .active_border_stops()
+            .unwrap_or_else(|| [self.border_hex(), self.border_hex()]);
+        hypr_gradient(&a, &b, self.chrome_or_default().gradient)
+    }
+
+    pub fn hypr_inactive_border(&self) -> Option<String> {
+        let a = mix_hex(&self.background, &self.foreground, 0.10);
+        let b = mix_hex(&a, &self.background, 0.40);
+        let [c0, c1] = self.inactive_border_stops().unwrap_or([a, b]);
+        hypr_gradient(&c0, &c1, self.chrome_or_default().gradient)
+    }
+
+    /// Suite accent — palette slot 4 (Blue / `--accent-blue`).
+    pub fn accent(&self) -> &str {
+        self.palette.get(4).map(|s| s.as_str()).unwrap_or("#458588")
+    }
+
+    /// Ensure exactly 16 palette entries (pad/truncate) for a valid Profile.
+    pub fn normalized_palette(&self) -> [String; 16] {
+        let mut arr: [String; 16] = Default::default();
+        for (i, slot) in arr.iter_mut().enumerate() {
+            *slot = self
+                .palette
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| "#000000".to_string());
+        }
+        arr
+    }
+}
+
+/// Built-in profiles shown in every app's theme selector.
+///
+/// Loaded from `profiles.json` (Neuronix first, then well-known themes).
+pub fn builtin_profiles() -> &'static [Profile] {
+    static BUILTINS: OnceLock<&'static [Profile]> = OnceLock::new();
+    BUILTINS.get_or_init(|| {
+        let parsed: Vec<ProfileData> =
+            serde_json::from_str(include_str!("../profiles.json")).unwrap_or_default();
+        let mut profiles: Vec<Profile> = parsed.iter().map(|d| *leak_profile(d)).collect();
+        if profiles.is_empty() {
+            profiles.push(NEURONIX_FALLBACK);
+        } else if let Some(idx) = profiles.iter().position(|p| p.id == "neuronix") {
+            if idx != 0 {
+                profiles.swap(0, idx);
+            }
+        } else {
+            profiles.insert(0, NEURONIX_FALLBACK);
+        }
+        Box::leak(profiles.into_boxed_slice())
+    })
+}
+
+/// Whether an id belongs to a user-saved custom profile (not a built-in).
+pub fn is_custom_profile(id: &str) -> bool {
+    !builtin_profiles().iter().any(|p| p.id == id) && custom_profile_data(id).is_some()
+}
+
+/// Built-in and custom profiles, in menu order (built-ins first, then custom).
+pub fn all_profiles() -> Vec<&'static Profile> {
+    refresh_custom_registry();
+    let mut out: Vec<&'static Profile> = builtin_profiles().iter().collect();
+    CUSTOM_REGISTRY.with(|reg| {
+        let reg = reg.borrow();
+        let mut customs: Vec<&'static Profile> = reg.values().map(|(_, p)| *p).collect();
+        customs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out.extend(customs);
+    });
+    out
+}
+
+pub fn profile_by_id(id: &str) -> Option<&'static Profile> {
+    if let Some(p) = builtin_profiles().iter().find(|p| p.id == id) {
+        return Some(p);
+    }
+    refresh_custom_registry();
+    CUSTOM_REGISTRY.with(|reg| reg.borrow().get(id).map(|(_, p)| *p))
+}
+
+pub fn default_profile_id() -> &'static str {
+    "neuronix"
+}
+
+pub fn default_profile() -> &'static Profile {
+    profile_by_id(default_profile_id()).unwrap_or_else(|| &builtin_profiles()[0])
+}
+
+/// Current shared theme id (`~/.config/gtk-apps/theme.toml`).
+pub fn load_theme_id() -> String {
+    let path = theme_path();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match toml::from_str::<ThemeFile>(&text) {
+            Ok(t) if profile_by_id(&t.profile).is_some() => t.profile,
+            _ => default_profile_id().to_string(),
+        },
+        Err(_) => default_profile_id().to_string(),
+    }
+}
+
+pub fn save_theme_id(id: &str) {
+    if profile_by_id(id).is_none() {
+        return;
+    }
+    let dir = theme_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let file = ThemeFile {
+        profile: id.to_string(),
+    };
+    if let Ok(text) = toml::to_string_pretty(&file) {
+        let _ = std::fs::write(theme_path(), text);
+    }
+}
+
+pub fn load_profile() -> &'static Profile {
+    profile_by_id(&load_theme_id()).unwrap_or_else(default_profile)
+}
+
+// ---------------------------------------------------------------------------
+// custom (user) profiles — ~/.config/gtk-apps/custom-profiles.json
+// ---------------------------------------------------------------------------
+
+/// Path to the user's custom profile store (JSON array of [`ProfileData`]).
+pub fn custom_profiles_path() -> PathBuf {
+    theme_dir().join("custom-profiles.json")
+}
+
+/// All user-saved custom profiles (empty if the file is missing/invalid).
+pub fn load_custom_profiles() -> Vec<ProfileData> {
+    match std::fs::read_to_string(custom_profiles_path()) {
+        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn write_custom_profiles(list: &[ProfileData]) {
+    let dir = theme_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(text) = serde_json::to_string_pretty(list) {
+        let _ = std::fs::write(custom_profiles_path(), text);
+    }
+}
+
+/// Owned data for a custom profile id (`None` for built-ins / unknown ids).
+pub fn custom_profile_data(id: &str) -> Option<ProfileData> {
+    load_custom_profiles().into_iter().find(|p| p.id == id)
+}
+
+/// Owned data for any known profile id (built-in or custom).
+pub fn profile_data_by_id(id: &str) -> Option<ProfileData> {
+    if let Some(p) = builtin_profiles().iter().find(|p| p.id == id) {
+        return Some(ProfileData::from_profile(p));
+    }
+    custom_profile_data(id)
+}
+
+/// Turn a display name into a stable, unique, filesystem-safe custom id.
+///
+/// Collisions with built-in ids and other custom ids (unless it is the
+/// `keep` id being re-saved) get a numeric suffix.
+pub fn custom_id_for_name(name: &str, keep: Option<&str>) -> String {
+    let base: String = name
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let base: String = base
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let base = if base.is_empty() {
+        "custom".to_string()
+    } else {
+        format!("custom-{base}")
+    };
+
+    let existing = load_custom_profiles();
+    let taken = |candidate: &str| -> bool {
+        if Some(candidate) == keep {
+            return false;
+        }
+        builtin_profiles().iter().any(|p| p.id == candidate)
+            || existing.iter().any(|p| p.id == candidate)
+    };
+
+    if !taken(&base) {
+        return base;
+    }
+    let mut n = 2;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !taken(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Insert or replace a custom profile (matched by `data.id`), then refresh the
+/// in-process registry so [`profile_by_id`] / [`all_profiles`] see it at once.
+pub fn save_custom_profile(data: &ProfileData) {
+    let mut list = load_custom_profiles();
+    if let Some(slot) = list.iter_mut().find(|p| p.id == data.id) {
+        *slot = data.clone();
+    } else {
+        list.push(data.clone());
+    }
+    write_custom_profiles(&list);
+    refresh_custom_registry();
+}
+
+/// Remove a custom profile by id (no-op for built-ins / unknown ids).
+pub fn delete_custom_profile(id: &str) {
+    let mut list = load_custom_profiles();
+    let before = list.len();
+    list.retain(|p| p.id != id);
+    if list.len() != before {
+        write_custom_profiles(&list);
+        refresh_custom_registry();
+    }
+}
+
+/// GTK chrome CSS derived from a profile (window / header / toolbars / menus).
+///
+/// Intentionally broad so symbolic toolbar buttons, menubars, and panels pick up
+/// readable fg/bg instead of leaving Adwaita defaults that fight the profile.
+pub fn chrome_css(profile: &Profile) -> String {
+    chrome_css_raw(
+        profile.foreground,
+        profile.background,
+        profile.accent(),
+        profile.palette[1],
+    )
+}
+
+/// Like [`chrome_css`] but for in-progress (unsaved) [`ProfileData`] — used by
+/// the theme editor for live preview without persisting anything.
+pub fn chrome_css_data(data: &ProfileData) -> String {
+    let palette = data.normalized_palette();
+    chrome_css_raw(
+        &data.foreground,
+        &data.background,
+        data.accent(),
+        palette.get(1).map(|s| s.as_str()).unwrap_or("#cc241d"),
+    )
+}
+
+/// Chrome CSS from raw colors so both static [`Profile`]s and editable
+/// [`ProfileData`] share one (large) template.
+fn chrome_css_raw(fg: &str, bg: &str, accent: &str, accent_red: &str) -> String {
+    let surface = mix_hex(bg, fg, 0.10);
+    let surface_alt = mix_hex(bg, fg, 0.18);
+    let is_dark = relative_luminance(bg) < 0.45;
+    let border = format!("alpha({fg}, 0.18)");
+    let hover = format!("alpha({fg}, 0.10)");
+    let active = format!("alpha({fg}, 0.16)");
+    // Suggested-action label: light on dark accents, dark on light accents.
+    let on_accent = if relative_luminance(accent) < 0.55 {
+        "#fbf1c7"
+    } else {
+        "#1d2021"
+    };
+    // Window controls (min/max/close): muted icon, brighter on hover — no bg wash.
+    let (wc_icon, wc_icon_hover) = if is_dark {
+        (format!("alpha({fg}, 0.55)"), mix_hex(fg, "#ffffff", 0.45))
+    } else {
+        (format!("alpha({fg}, 0.50)"), mix_hex(fg, "#000000", 0.35))
+    };
+    // Editor body text: on dark profiles, soften near-white fg to a soft grey
+    // so gtk-edit isn't harsh bright white on black.
+    let editor_fg = if is_dark {
+        mix_hex(fg, bg, 0.20)
+    } else {
+        fg.to_string()
+    };
+
+    format!(
+        r#"
+/* ---- suite accent → Adwaita --accent-blue / blue_3 ----
+ * Palette slot 4 is the configurable accent used for selection, tabs,
+ * suggested buttons, and text highlights across all suite apps.
+ */
+@define-color accent_bg_color {accent};
+@define-color accent_fg_color {on_accent};
+@define-color accent_color {accent};
+@define-color theme_selected_bg_color {accent};
+@define-color theme_selected_fg_color {on_accent};
+@define-color theme_unfocused_selected_bg_color {accent};
+@define-color theme_unfocused_selected_fg_color {on_accent};
+@define-color blue_3 {accent};
+
+:root {{
+  --accent-bg-color: {accent};
+  --accent-fg-color: {on_accent};
+  --accent-color: {accent};
+  --accent-blue: {accent};
+  --blue-3: {accent};
+}}
+
+/* ---- window chrome ----
+ * Clear Adwaita background-image layers — otherwise modal gtk::Windows keep a
+ * light cream shell while our buttons go dark (unreadable labels).
+ */
+window, window.csd, window.solid-csd {{
+  background: {bg};
+  background-color: {bg};
+  background-image: none;
+  color: {fg};
+}}
+window label, window .title {{
+  color: {fg};
+}}
+window row:selected label,
+window listbox > row:selected label,
+window .navigation-sidebar > row:selected,
+window .navigation-sidebar > row:selected *,
+window .navigation-sidebar > row:selected label,
+window .navigation-sidebar > row:selected image {{
+  color: {on_accent};
+}}
+
+/* ---- header / menu / toolbar bars ----
+ * Adwaita-dark paints headerbars with `background` + gradient / image layers.
+ * Setting only background-color leaves those dark layers visible under a light
+ * suite profile — clear background-image and use the shorthand.
+ */
+headerbar,
+headerbar.default-decoration,
+headerbar:backdrop,
+.titlebar,
+.titlebar:backdrop,
+menubar,
+popovermenubar,
+.menubar,
+.toolbar,
+toolbar,
+actionbar,
+.meld-actionbar {{
+  background: {surface};
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+  border-bottom-color: {border};
+  box-shadow: none;
+}}
+headerbar {{
+  border-bottom: 1px solid {border};
+}}
+.toolbar, toolbar {{
+  border-bottom: 1px solid {border};
+  padding: 2px 4px;
+}}
+menubar, popovermenubar, .menubar {{
+  border-bottom: 1px solid {border};
+}}
+/* gtk-meld path bars — Adwaita ActionBar picks up accent tint (purple). */
+actionbar > revealer > box,
+.meld-actionbar > revealer > box {{
+  background: {surface};
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+  border-color: {border};
+  box-shadow: none;
+}}
+headerbar *,
+menubar *,
+popovermenubar *,
+.toolbar *,
+toolbar *,
+actionbar *,
+.meld-actionbar * {{
+  color: {fg};
+}}
+headerbar button,
+menubar button,
+popovermenubar button,
+.toolbar button,
+toolbar button,
+button.flat,
+button.image-button {{
+  color: {fg};
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}}
+headerbar button:hover,
+.toolbar button:hover,
+toolbar button:hover,
+button.flat:hover,
+button.image-button:hover {{
+  background-color: {hover};
+  background-image: none;
+  color: {fg};
+}}
+headerbar button:active,
+headerbar button:checked,
+.toolbar button:active,
+.toolbar button:checked,
+toolbar button:active,
+toolbar button:checked {{
+  background-color: {active};
+  background-image: none;
+  color: {fg};
+}}
+
+/* Window chrome controls (min / max / close): no background wash; hover
+ * only brightens the symbolic icon (lighter grey on dark themes, deeper
+ * grey/black on light themes).
+ */
+windowcontrols button,
+windowcontrols button.minimize,
+windowcontrols button.maximize,
+windowcontrols button.close,
+windowcontrols button:backdrop,
+headerbar windowcontrols button,
+.titlebar windowcontrols button {{
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+  color: {wc_icon};
+}}
+windowcontrols button image {{
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  color: {wc_icon};
+  -gtk-icon-filter: none;
+  opacity: 1;
+}}
+windowcontrols button:hover,
+windowcontrols button:active,
+windowcontrols button:checked,
+windowcontrols button.minimize:hover,
+windowcontrols button.minimize:active,
+windowcontrols button.maximize:hover,
+windowcontrols button.maximize:active,
+windowcontrols button.close:hover,
+windowcontrols button.close:active,
+headerbar windowcontrols button:hover,
+headerbar windowcontrols button:active,
+.titlebar windowcontrols button:hover,
+.titlebar windowcontrols button:active {{
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
+  color: {wc_icon_hover};
+}}
+windowcontrols button:hover image,
+windowcontrols button:active image {{
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  color: {wc_icon_hover};
+  -gtk-icon-filter: none;
+  opacity: 1;
+}}
+
+/* ---- generic buttons / entries ----
+ * Always set label color explicitly — Adwaita often keeps dark label text on
+ * our recolored button backgrounds (unreadable Cancel / Create dialogs).
+ */
+button {{
+  color: {fg};
+  background: {surface_alt};
+  background-color: {surface_alt};
+  background-image: none;
+  border: 1px solid {border};
+  box-shadow: none;
+}}
+button label {{
+  color: {fg};
+}}
+button:hover {{
+  background: {hover};
+  background-color: {hover};
+  background-image: none;
+  color: {fg};
+}}
+button:hover label {{
+  color: {fg};
+}}
+button.suggested-action,
+button.suggested-action:hover,
+button.suggested-action:active {{
+  background: {accent};
+  background-color: {accent};
+  background-image: none;
+  color: {on_accent};
+  border-color: {accent};
+}}
+button.suggested-action label,
+button.suggested-action:hover label {{
+  color: {on_accent};
+}}
+button.destructive-action,
+button.destructive-action:hover {{
+  background: {accent_red};
+  background-color: {accent_red};
+  background-image: none;
+  color: #ffffff;
+  border-color: {accent_red};
+}}
+button.destructive-action label {{
+  color: #ffffff;
+}}
+entry, searchentry, spinbutton, textview {{
+  background-color: {bg};
+  color: {fg};
+  caret-color: {fg};
+  border-color: {border};
+}}
+entry:focus, searchentry:focus {{
+  border-color: {accent};
+}}
+entry selection {{
+  background-color: alpha({accent}, 0.45);
+  color: {fg};
+}}
+
+/* Editor / TextView selection — match suite accent (not stock Adwaita blue). */
+textview selection,
+textview text selection,
+.textview selection,
+.sourceview selection,
+.editor-view selection,
+.editor-view text selection,
+textview.gtk-edit-view selection,
+textview.gtk-edit-view text selection {{
+  background-color: alpha({accent}, 0.45);
+  color: {fg};
+}}
+
+/* ---- side panels / notebooks ----
+ * Avoid styling bare listbox/listview (breaks gtk-edit File Browser).
+ * gtk-files opts in via .files-view / .file-list / .file-grid.
+ */
+.sidebar,
+.navigation-sidebar,
+.navigation-sidebar > row {{
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+}}
+.navigation-sidebar > row:hover {{
+  background-color: {hover};
+  background-image: none;
+}}
+.navigation-sidebar > row:selected {{
+  background-color: {accent};
+  background-image: none;
+  color: {on_accent};
+}}
+.navigation-sidebar > row:selected *,
+.navigation-sidebar > row:selected label,
+.navigation-sidebar > row:selected image {{
+  color: {on_accent};
+}}
+
+/* Opt-in content surfaces (apps add these classes) — kills leftover Adwaita grey */
+.gtk-content,
+.side-panel,
+.editor-view,
+.files-view {{
+  background-color: {bg};
+  background-image: none;
+  color: {fg};
+}}
+
+/* Side panels / plugin lists (gtk-edit File Browser, etc.) */
+.side-panel,
+listbox.side-panel,
+scrolledwindow.side-panel,
+.side-panel listbox,
+.side-panel scrolledwindow {{
+  background-color: {bg};
+  background-image: none;
+  color: {fg};
+}}
+listbox.side-panel row,
+.side-panel listbox row {{
+  color: {fg};
+  background-image: none;
+}}
+listbox.side-panel row label,
+.side-panel listbox row label,
+.side-panel label {{
+  color: {fg};
+}}
+listbox.side-panel row:hover,
+.side-panel listbox row:hover {{
+  background-color: {hover};
+  background-image: none;
+}}
+listbox.side-panel row:selected,
+.side-panel listbox row:selected {{
+  background-color: {accent};
+  background-image: none;
+  color: {on_accent};
+}}
+listbox.side-panel row:selected *,
+.side-panel listbox row:selected * {{
+  color: {on_accent};
+}}
+
+/* SourceView / TextView — profile bg + softened editor fg on dark themes */
+.editor-view,
+textview.editor-view,
+textview.gtk-edit-view,
+textview.gtk-diff-view,
+.sourceview.editor-view {{
+  background-color: {bg};
+  background-image: none;
+  color: {editor_fg};
+}}
+.editor-view text,
+textview.editor-view text,
+textview.gtk-edit-view text,
+textview.gtk-diff-view text,
+.sourceview.editor-view text {{
+  background-color: {bg};
+  background-image: none;
+  color: {editor_fg};
+}}
+.editor-view border,
+textview.editor-view border,
+textview.gtk-edit-view border,
+textview.gtk-diff-view border {{
+  background-color: {surface};
+  background-image: none;
+  color: alpha({editor_fg}, 0.7);
+}}
+scrolledwindow.gtk-content,
+scrolledwindow.editor-view {{
+  background-color: {bg};
+  background-image: none;
+  color: {editor_fg};
+}}
+
+/* gtk-files main listing (ColumnView / GridView) */
+.files-view,
+.file-list,
+.file-grid,
+columnview.file-list,
+columnview.file-list listview,
+gridview.file-grid {{
+  background-color: {bg};
+  background-image: none;
+  color: {fg};
+}}
+columnview.file-list > header,
+columnview.file-list header {{
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+  border-bottom: 1px solid {border};
+}}
+columnview.file-list header button,
+columnview.file-list header label {{
+  color: {fg};
+  background-color: transparent;
+  background-image: none;
+}}
+.file-list row:hover,
+.file-grid child:hover,
+columnview.file-list listview row:hover,
+gridview.file-grid child:hover {{
+  background-color: {hover};
+  background-image: none;
+}}
+.file-list row:selected,
+.file-grid child:selected,
+columnview.file-list listview row:selected,
+gridview.file-grid child:selected {{
+  background-color: alpha({accent}, 0.35);
+  background-image: none;
+  color: {fg};
+}}
+.file-row-content label,
+.file-list label,
+.file-grid label {{
+  color: {fg};
+}}
+.file-list label.dim-label,
+.file-grid label.dim-label {{
+  color: alpha({fg}, 0.65);
+}}
+
+/* calc / image content shells */
+.calc-display,
+.display-container,
+.history-view,
+.math-buttons,
+.image-scroller,
+.image-view,
+stack.gtk-content {{
+  background-color: {bg};
+  background-image: none;
+  color: {fg};
+}}
+.calc-display {{
+  color: {fg};
+  caret-color: {fg};
+}}
+
+listview row:hover,
+listbox row:hover,
+gridview child:hover {{
+  background-color: {hover};
+  background-image: none;
+}}
+listview row:selected,
+listbox row:selected,
+gridview child:selected {{
+  background-color: alpha({accent}, 0.35);
+  background-image: none;
+  color: {fg};
+}}
+listbox row label,
+listview row label {{
+  color: inherit;
+}}
+notebook {{
+  background-color: {bg};
+  background-image: none;
+  color: {fg};
+}}
+notebook > header {{
+  background: {surface};
+  background-color: {surface};
+  background-image: none;
+  border-color: {border};
+}}
+notebook > header > tabs > tab {{
+  background-color: transparent;
+  background-image: none;
+  color: {fg};
+}}
+notebook > header > tabs > tab:checked {{
+  background-color: {surface_alt};
+  background-image: none;
+  color: {fg};
+}}
+/* gtk-edit: document tabs expand equally; trailing "+" stays compact. */
+notebook.gtk-edit-tabs > header > tabs > tab {{
+  min-width: 0;
+}}
+notebook.gtk-edit-tabs > header > tabs > tab:has(.gtk-edit-new-tab) {{
+  padding: 0;
+  min-width: 2.25em;
+  max-width: 2.25em;
+}}
+.gtk-edit-new-tab {{
+  min-width: 2.25em;
+  max-width: 2.25em;
+}}
+button.gtk-edit-new-tab-label {{
+  min-width: 2.25em;
+  max-width: 2.25em;
+  padding: 4px 0;
+  border-radius: 0;
+  font-weight: bold;
+  font-size: 1.15em;
+}}
+notebook > stack {{
+  background-color: {bg};
+  background-image: none;
+}}
+
+/* ---- popovers / menus / dialogs ----
+ * Paint only `contents` (rounded). Filling bare `popover` draws a sharp
+ * rectangle behind the menu — the “bleed” past the border.
+ * GtkDropDown / ListView popups also nest scrolledwindow+listview; those must
+ * stay transparent or Adwaita’s grey plate shows through and past the radius.
+ */
+popover,
+popover.background,
+popover.menu {{
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}}
+popover contents,
+popover.menu contents,
+.menu {{
+  background: {surface};
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+  border: 1px solid {border};
+  border-radius: 12px;
+  box-shadow: none;
+}}
+popover > arrow {{
+  background: {surface};
+  background-color: {surface};
+  background-image: none;
+  border: none;
+}}
+popover contents > *,
+popover contents scrolledwindow,
+popover contents scrolledwindow > viewport,
+popover contents viewport,
+popover contents listview,
+popover contents .view {{
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  color: {fg};
+}}
+popover contents modelbutton,
+popover contents label,
+popover contents listview row label {{
+  color: {fg};
+}}
+/* Roomier menu rows (stock model buttons + IconMenu custom rows). */
+popover.menu contents modelbutton,
+popover contents modelbutton {{
+  padding: 8px 12px;
+  min-height: 32px;
+  margin: 2px 4px;
+  border-radius: 6px;
+}}
+popover.menu contents button.gtk-theme-menu-row,
+popover contents button.gtk-theme-menu-row {{
+  padding: 8px 12px;
+  min-height: 32px;
+  margin: 2px 4px;
+  border-radius: 6px;
+  color: {fg};
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+}}
+/* Icon + label flush left (GtkButton otherwise centers its child). */
+popover.menu contents button.gtk-theme-menu-row > box,
+popover contents button.gtk-theme-menu-row > box {{
+  margin: 0;
+  min-width: 12em;
+}}
+popover.menu contents button.gtk-theme-menu-row label,
+popover contents button.gtk-theme-menu-row label {{
+  color: {fg};
+  text-align: left;
+}}
+popover contents modelbutton:hover,
+popover contents listview > row:hover,
+popover.menu contents button.gtk-theme-menu-row:hover,
+popover contents button.gtk-theme-menu-row:hover {{
+  background-color: {hover};
+  background-image: none;
+}}
+popover contents listview > row:selected {{
+  background-color: alpha({accent}, 0.35);
+  background-image: none;
+  color: {fg};
+}}
+
+/* Closed GtkDropDown toggle (and font dialog button chrome) */
+dropdown > button,
+dropdown > togglebutton,
+button.combo,
+fontbutton,
+fontdialogbutton {{
+  background: {surface_alt};
+  background-color: {surface_alt};
+  background-image: none;
+  color: {fg};
+  border-color: {border};
+}}
+dropdown > button:hover,
+dropdown > togglebutton:hover,
+button.combo:hover {{
+  background: {hover};
+  background-color: {hover};
+  background-image: none;
+}}
+
+/* Modal dialogs are often plain gtk::Window (not GtkDialog) — theme both */
+dialog,
+messagedialog,
+window.gtk-dialog,
+window.gtk-dialog.csd {{
+  background: {bg};
+  background-color: {bg};
+  background-image: none;
+  color: {fg};
+}}
+dialog headerbar,
+messagedialog headerbar,
+window.gtk-dialog headerbar,
+window.gtk-dialog .titlebar {{
+  background: {surface};
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+  border-bottom: 1px solid {border};
+}}
+dialog label,
+messagedialog label,
+window.gtk-dialog label {{
+  color: {fg};
+}}
+dialog entry,
+messagedialog entry,
+window.gtk-dialog entry {{
+  background-color: {bg};
+  color: {fg};
+  caret-color: {fg};
+  border-color: {border};
+}}
+dialog button,
+messagedialog button,
+window.gtk-dialog button {{
+  background: {surface_alt};
+  background-color: {surface_alt};
+  background-image: none;
+  color: {fg};
+  border: 1px solid {border};
+}}
+dialog button label,
+messagedialog button label,
+window.gtk-dialog button label {{
+  color: {fg};
+}}
+dialog button.suggested-action,
+messagedialog button.suggested-action,
+window.gtk-dialog button.suggested-action,
+dialog button.suggested-action:hover,
+messagedialog button.suggested-action:hover,
+window.gtk-dialog button.suggested-action:hover {{
+  background: {accent};
+  background-color: {accent};
+  background-image: none;
+  color: {on_accent};
+  border-color: {accent};
+}}
+dialog button.suggested-action label,
+messagedialog button.suggested-action label,
+window.gtk-dialog button.suggested-action label {{
+  color: {on_accent};
+}}
+/* Flatten window-control chrome in dialog titlebars */
+window.gtk-dialog headerbar windowcontrols button,
+window.gtk-dialog .titlebar windowcontrols button {{
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+  color: {fg};
+}}
+/* FileChooserDialog puts Cancel / Open / Save in the headerbar — keep them
+ * solid. suggested-action must win over the generic dialog button fg wash. */
+window.gtk-dialog headerbar button.text-button,
+window.gtk-dialog .titlebar button.text-button {{
+  background: {surface_alt};
+  background-color: {surface_alt};
+  background-image: none;
+  border: 1px solid {border};
+  box-shadow: none;
+  color: {fg};
+}}
+window.gtk-dialog headerbar button.text-button label,
+window.gtk-dialog .titlebar button.text-button label {{
+  color: {fg};
+}}
+window.gtk-dialog headerbar button.suggested-action,
+window.gtk-dialog headerbar button.suggested-action:hover,
+window.gtk-dialog headerbar button.suggested-action:active,
+window.gtk-dialog .titlebar button.suggested-action,
+window.gtk-dialog .titlebar button.suggested-action:hover,
+window.gtk-dialog .titlebar button.suggested-action:active,
+dialog button.suggested-action:active,
+window.gtk-dialog button.suggested-action:active {{
+  background: {accent};
+  background-color: {accent};
+  background-image: none;
+  border: 1px solid {accent};
+  box-shadow: none;
+  color: {on_accent};
+}}
+window.gtk-dialog headerbar button.suggested-action label,
+window.gtk-dialog headerbar button.suggested-action:hover label,
+window.gtk-dialog .titlebar button.suggested-action label,
+window.gtk-dialog .titlebar button.suggested-action:hover label {{
+  color: {on_accent};
+}}
+/* Preferences notebook / plugins list — kill Adwaita grey .view wash */
+window.gtk-dialog notebook,
+window.gtk-dialog notebook > stack,
+window.gtk-dialog scrolledwindow,
+window.gtk-dialog viewport,
+window.gtk-dialog listbox,
+window.gtk-dialog listbox row,
+window.gtk-dialog .view {{
+  background: {bg};
+  background-color: {bg};
+  background-image: none;
+  color: {fg};
+}}
+window.gtk-dialog listbox row:hover {{
+  background-color: {hover};
+  background-image: none;
+}}
+window.gtk-dialog checkbutton label,
+window.gtk-dialog spinbutton,
+window.gtk-dialog dropdown {{
+  color: {fg};
+}}
+
+/* About dialog credits / license pages — Adwaita paints .view + .frame grey */
+window.aboutdialog,
+.aboutdialog {{
+  background: {bg};
+  background-color: {bg};
+  background-image: none;
+  color: {fg};
+}}
+window.aboutdialog headerbar,
+window.aboutdialog .titlebar {{
+  background: {surface};
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+  border-bottom: 1px solid {border};
+}}
+window.aboutdialog label {{
+  color: {fg};
+}}
+window.aboutdialog .view,
+window.aboutdialog viewport,
+window.aboutdialog viewport.view,
+window.aboutdialog scrolledwindow,
+window.aboutdialog scrolledwindow.frame,
+window.aboutdialog textview,
+window.aboutdialog textview text,
+window.aboutdialog textview.view {{
+  background: {bg};
+  background-color: {bg};
+  background-image: none;
+  color: {fg};
+  border-color: {border};
+  box-shadow: none;
+}}
+window.aboutdialog stackswitcher button,
+window.aboutdialog stackswitcher togglebutton {{
+  background: {surface_alt};
+  background-color: {surface_alt};
+  background-image: none;
+  color: {fg};
+  border-color: {border};
+}}
+window.aboutdialog stackswitcher button:checked,
+window.aboutdialog stackswitcher togglebutton:checked {{
+  background: alpha({accent}, 0.35);
+  background-color: alpha({accent}, 0.35);
+  background-image: none;
+  color: {fg};
+}}
+
+/* In-app file chooser (FileChooserDialog / FileChooserWidget) — portal
+   * FileDialog cannot be themed; these widgets live in-process and follow us.
+   */
+filechooser,
+filechooserwidget,
+.window.gtk-dialog filechooser,
+.window.gtk-dialog filechooserwidget {{
+  background: {bg};
+  background-color: {bg};
+  color: {fg};
+}}
+filechooser *,
+filechooserwidget * {{
+  color: {fg};
+}}
+filechooser listview,
+filechooser treeview,
+filechooser columnview,
+filechooserwidget listview,
+filechooserwidget treeview,
+filechooserwidget columnview,
+filechooser .view,
+filechooserwidget .view {{
+  background-color: {bg};
+  color: {fg};
+}}
+filechooser row:selected,
+filechooserwidget row:selected,
+filechooser listview > row:selected,
+filechooserwidget listview > row:selected {{
+  background-color: alpha({accent}, 0.35);
+  color: {fg};
+}}
+filechooser entry,
+filechooser searchentry,
+filechooserwidget entry,
+filechooserwidget searchentry {{
+  background-color: {surface_alt};
+  color: {fg};
+  caret-color: {fg};
+  border-color: {border};
+}}
+filechooser placessidebar,
+filechooserwidget placessidebar,
+placessidebar {{
+  background-color: {surface};
+  color: {fg};
+}}
+filechooser placessidebar row:selected,
+placessidebar row:selected {{
+  background-color: alpha({accent}, 0.35);
+  color: {fg};
+}}
+pathbar button,
+.pathbar button {{
+  background: transparent;
+  background-color: transparent;
+  color: {fg};
+  border: none;
+  box-shadow: none;
+}}
+pathbar button:hover,
+.pathbar button:hover {{
+  background-color: {hover};
+  color: {fg};
+}}
+/* Breadcrumbs live in a ScrolledWindow; suite themes paint scrolledwindow
+ * with the dark window bg, which made the location bar look inset/black. */
+headerbar .pathbar,
+headerbar .pathbar > *,
+.pathbar,
+.pathbar scrolledwindow,
+.pathbar scrolledwindow > viewport,
+.pathbar viewport,
+.pathbar > stack,
+.pathbar .linked {{
+  background-color: transparent;
+  background-image: none;
+  border: none;
+  box-shadow: none;
+}}
+
+/* ---- panes / separators / status ----
+ * Adwaita-dark paned separators use background-image: image(#1b1b1b) and
+ * .wide fills with #353535 — override both layers.
+ */
+separator {{
+  background-color: {border};
+  background-image: none;
+}}
+paned > separator,
+paned > separator.wide,
+paned > separator:hover,
+paned > separator.wide:hover {{
+  background: {border};
+  background-color: {border};
+  background-image: none;
+  min-width: 4px;
+  min-height: 4px;
+}}
+statusbar, .statusbar {{
+  background: {surface};
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+  border-top: 1px solid {border};
+}}
+
+/* ---- gtk-files terminal sidebar (right) ---- */
+.terminal-panel {{
+  background-color: {bg};
+  background-image: none;
+  color: {fg};
+  border-left: 1px solid {border};
+}}
+.terminal-panel-header {{
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+}}
+
+/* ---- scrollbars ---- */
+scrollbar, scrollbar trough {{
+  background-color: {bg};
+}}
+scrollbar slider {{
+  background-color: alpha({fg}, 0.35);
+}}
+scrollbar slider:hover {{
+  background-color: alpha({fg}, 0.5);
+}}
+"#
+    )
+}
+
+/// Tag a modal `gtk::Window` so dialog chrome (header, body, buttons) follows
+/// the suite profile even when Adwaita paints transient windows lightly.
+pub fn style_dialog(window: &impl IsA<gtk::Widget>) {
+    window.add_css_class("gtk-dialog");
+}
+
+/// CSS for Neuronix card-choice dialogs (Setup Sync, Settings hub).
+///
+/// Hard-coded `#2e2e2e` greys ignore the suite profile; this uses the same
+/// Night Owl / custom surfaces as gtk-files so the picker matches the app.
+pub fn choice_dialog_css() -> String {
+    let p = load_profile();
+    let bg = p.background;
+    let fg = p.foreground;
+    let surface = p.surface_hex();
+    let tile = p.surface_alt_hex();
+    let accent = p.accent();
+    let muted = mix_hex(fg, bg, 0.40);
+    let hover = mix_hex(bg, fg, 0.26);
+    format!(
+        r#"
+window.neuronix-choice {{
+  background-color: {bg};
+  color: {fg};
+  border-radius: 12px;
+}}
+box.neuronix-root {{
+  background-color: {bg};
+}}
+label.neuronix-title {{
+  color: {fg};
+  font-size: 22px;
+  font-weight: 700;
+}}
+label.neuronix-subtitle {{
+  color: {muted};
+  font-size: 13px;
+}}
+button.neuronix-card {{
+  background-color: {tile};
+  background-image: none;
+  border: 1px solid {surface};
+  border-radius: 10px;
+  box-shadow: none;
+  outline: none;
+  padding: 14px 18px;
+  margin: 0;
+  min-height: 56px;
+}}
+button.neuronix-card:hover {{
+  background-color: {hover};
+  border-color: {accent};
+}}
+button.neuronix-card label.neuronix-row-title {{
+  color: {fg};
+  font-size: 15px;
+  font-weight: 600;
+}}
+button.neuronix-card label.neuronix-row-desc {{
+  color: {muted};
+  font-size: 12px;
+}}
+button.neuronix-close {{
+  background-color: {tile};
+  background-image: none;
+  color: {fg};
+  border: 1px solid {surface};
+  border-radius: 8px;
+  padding: 10px 20px;
+  font-size: 13px;
+  min-width: 88px;
+}}
+button.neuronix-close:hover {{
+  background-color: {hover};
+  border-color: {accent};
+}}
+"#
+    )
+}
+
+/// Present an in-app file chooser that follows the suite theme.
+///
+/// GTK’s portal-backed [`gtk::FileDialog`] is drawn by the desktop and ignores
+/// app CSS — use this instead whenever the picker should match rusty chrome.
+#[allow(deprecated)]
+pub fn present_file_chooser(
+    parent: Option<&impl IsA<gtk::Window>>,
+    title: &str,
+    action: gtk::FileChooserAction,
+    accept_label: &str,
+    filter: Option<&gtk::FileFilter>,
+    initial_name: Option<&str>,
+    callback: impl FnOnce(Option<gio::File>) + 'static,
+) {
+    present_file_chooser_at(
+        parent,
+        title,
+        action,
+        accept_label,
+        filter,
+        initial_name,
+        None,
+        callback,
+    );
+}
+
+/// Like [`present_file_chooser`], optionally starting in `current_folder`.
+#[allow(deprecated)]
+pub fn present_file_chooser_at(
+    parent: Option<&impl IsA<gtk::Window>>,
+    title: &str,
+    action: gtk::FileChooserAction,
+    accept_label: &str,
+    filter: Option<&gtk::FileFilter>,
+    initial_name: Option<&str>,
+    current_folder: Option<&gio::File>,
+    callback: impl FnOnce(Option<gio::File>) + 'static,
+) {
+    let dialog = gtk::FileChooserDialog::new(
+        Some(title),
+        parent,
+        action,
+        &[
+            ("Cancel", gtk::ResponseType::Cancel),
+            (accept_label, gtk::ResponseType::Accept),
+        ],
+    );
+    style_dialog(&dialog);
+    dialog.set_modal(true);
+    dialog.set_default_width(960);
+    dialog.set_default_height(700);
+
+    if let Some(filter) = filter {
+        dialog.add_filter(filter);
+        dialog.set_filter(filter);
+    }
+    if let Some(name) = initial_name {
+        dialog.set_current_name(name);
+    }
+    if let Some(folder) = current_folder {
+        let _ = dialog.set_current_folder(Some(folder));
+    }
+
+    // Suggested look, but do not make Extract/Open the default widget yet —
+    // a leftover context-menu click would instantly Accept the current folder.
+    if let Some(btn) = dialog.widget_for_response(gtk::ResponseType::Accept) {
+        btn.add_css_class("suggested-action");
+    }
+
+    let mapped_at = Rc::new(Cell::new(None::<Instant>));
+    dialog.connect_map({
+        let mapped_at = Rc::clone(&mapped_at);
+        let dialog = dialog.clone();
+        move |_| {
+            mapped_at.set(Some(Instant::now()));
+            let dialog = dialog.clone();
+            glib::timeout_add_local_once(Duration::from_millis(300), move || {
+                if let Some(btn) = dialog.widget_for_response(gtk::ResponseType::Accept) {
+                    dialog.set_default_widget(Some(&btn));
+                }
+            });
+        }
+    });
+
+    let callback = RefCell::new(Some(callback));
+    dialog.connect_response(move |dlg, response| {
+        // Nested Cancel/DeleteEvent from close() must not consume the callback.
+        if matches!(response, gtk::ResponseType::DeleteEvent) {
+            return;
+        }
+        let accept = matches!(response, gtk::ResponseType::Accept | gtk::ResponseType::Ok);
+        // Swallow the click that opened this dialog from a popover menu.
+        if accept {
+            let too_soon = mapped_at
+                .get()
+                .map(|t| t.elapsed() < Duration::from_millis(300))
+                .unwrap_or(true);
+            if too_soon {
+                return;
+            }
+        }
+        // Take before close() — close() can re-enter with Cancel and would
+        // otherwise call the callback with None, dropping the chosen file.
+        let Some(cb) = callback.borrow_mut().take() else {
+            return;
+        };
+        let file = match response {
+            gtk::ResponseType::Accept | gtk::ResponseType::Ok => dlg.file().or_else(|| {
+                let list = dlg.files();
+                (0..list.n_items())
+                    .find_map(|i| list.item(i).and_then(|o| o.downcast::<gio::File>().ok()))
+            }),
+            _ => None,
+        };
+        dlg.close();
+        cb(file);
+    });
+    dialog.present();
+}
+
+/// Load / update the shared chrome CSS provider for the default display.
+pub fn apply_chrome(profile: &Profile) {
+    apply_chrome_css(profile.is_dark(), &chrome_css(profile));
+}
+
+/// Live-preview chrome for in-progress (unsaved) [`ProfileData`].
+///
+/// Recolors every window in this process immediately without touching
+/// `theme.toml` — the theme editor calls this on every tweak.
+pub fn apply_chrome_data(data: &ProfileData) {
+    let is_dark = relative_luminance(&data.background) < 0.45;
+    apply_chrome_css(is_dark, &chrome_css_data(data));
+}
+
+fn apply_chrome_css(is_dark: bool, css: &str) {
+    // Align GTK's light/dark preference with the suite profile so Adwaita does
+    // not keep loading Default-dark assets under a light profile. Apps still
+    // rely on chrome CSS overrides when the desktop theme is forced to *-dark.
+    let hide_csd_controls = hyprbars_active();
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_application_prefer_dark_theme(is_dark);
+        // Hyprbars draws − □ ×; hide GTK CSD window controls to avoid doubles.
+        if hide_csd_controls {
+            settings.set_gtk_decoration_layout(Some(":"));
+        }
+    }
+
+    // Adwaita symbolics for menus/toolbars even when the session uses Faenza/etc.
+    ensure_adwaita_icons();
+
+    let css_owned;
+    let css = if hide_csd_controls {
+        css_owned = format!("{css}\n{HIDE_CSD_WINDOWCONTROLS_CSS}");
+        css_owned.as_str()
+    } else {
+        css
+    };
+
+    if let Some(display) = gdk::Display::default() {
+        CHROME_PROVIDER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let provider = slot.get_or_insert_with(|| {
+                let provider = gtk::CssProvider::new();
+                // Sit above per-app APPLICATION CSS so toolbars/menus actually recolor.
+                gtk::style_context_add_provider_for_display(
+                    &display,
+                    &provider,
+                    // Above app CSS; just under USER so ~/.config/*/style.css still wins.
+                    gtk::STYLE_PROVIDER_PRIORITY_USER.saturating_sub(10),
+                );
+                provider
+            });
+            provider.load_from_data(css);
+        });
+    }
+}
+
+/// Collapse / hide GTK client-side window controls (close etc.) when hyprbars
+/// already provides them.
+const HIDE_CSD_WINDOWCONTROLS_CSS: &str = r#"
+headerbar windowcontrols,
+.titlebar windowcontrols,
+windowcontrols {
+  opacity: 0;
+  min-width: 0;
+  padding: 0;
+  margin: 0;
+}
+headerbar windowcontrols button,
+.titlebar windowcontrols button,
+windowcontrols button {
+  min-width: 0;
+  min-height: 0;
+  padding: 0;
+  margin: 0;
+  opacity: 0;
+  border: none;
+  background: none;
+  background-image: none;
+  box-shadow: none;
+}
+"#;
+
+/// Preferred GtkSourceView scheme ids for a profile (first available wins).
+pub fn sourceview_scheme_candidates(profile_id: &str) -> &'static [&'static str] {
+    match profile_id {
+        "gruvbox-dark" => &["gruvbox-dark", "oblivion", "Adwaita-dark", "classic"],
+        "gruvbox-light" => &["gruvbox-light", "solarized-light", "Adwaita", "classic"],
+        "tokyo-night" | "tokyo-night-storm" => &["tokyo-night", "Adwaita-dark", "classic"],
+        "dracula" => &["dracula", "Adwaita-dark", "classic"],
+        "nord" => &["nord", "Adwaita-dark", "classic"],
+        "catppuccin-mocha" | "catppuccin-frappe" => {
+            &["catppuccin-mocha", "Adwaita-dark", "classic"]
+        }
+        "catppuccin-latte" => &["catppuccin-latte", "Adwaita", "classic"],
+        "rose-pine" | "rose-pine-moon" => &["rose-pine", "Adwaita-dark", "classic"],
+        "rose-pine-dawn" => &["rose-pine-dawn", "Adwaita", "classic"],
+        "one-dark" => &["one-dark", "oblivion", "Adwaita-dark", "classic"],
+        "monokai" => &["monokai", "oblivion", "Adwaita-dark", "classic"],
+        "kanagawa" => &["kanagawa", "Adwaita-dark", "classic"],
+        "everforest-dark" => &["everforest-dark", "Adwaita-dark", "classic"],
+        "ayu-dark" | "ayu-mirage" => &["ayu-dark", "Adwaita-dark", "classic"],
+        "night-owl" => &["night-owl", "Adwaita-dark", "classic"],
+        "palenight" => &["palenight", "Adwaita-dark", "classic"],
+        "material-darker" | "neuronix" => &["material-darker", "Adwaita-dark", "classic"],
+        "cobalt2" => &["cobalt", "Adwaita-dark", "classic"],
+        "zenburn" => &["zenburn", "oblivion", "Adwaita-dark", "classic"],
+        "tomorrow-night" => &["tomorrow-night", "Adwaita-dark", "classic"],
+        "oceanic-next" => &["oceanic-next", "Adwaita-dark", "classic"],
+        "github-dark" => &["github-dark", "Adwaita-dark", "classic"],
+        "github-light" => &["github-light", "Adwaita", "classic"],
+        "solarized-dark" => &["solarized-dark", "classic"],
+        "solarized-light" => &["solarized-light", "classic"],
+        "synthwave-84" => &["synthwave-84", "dracula", "Adwaita-dark", "classic"],
+        id if id.contains("light") || id.contains("latte") || id.contains("dawn") => {
+            &["Adwaita", "classic"]
+        }
+        _ => &["Adwaita-dark", "classic"],
+    }
+}
+
+/// Resolve a SourceView scheme id using an availability predicate from the host app.
+pub fn resolve_sourceview_scheme(
+    profile_id: &str,
+    is_available: impl Fn(&str) -> bool,
+) -> &'static str {
+    for id in sourceview_scheme_candidates(profile_id) {
+        if is_available(id) {
+            return id;
+        }
+    }
+    "classic"
+}
+
+/// Window-scoped action name that launches [`gtk-theme-editor`].
+///
+/// Menu models built by [`append_profile_menu`] activate `win.open-theme-editor`;
+/// call [`install_open_theme_editor_action`] once per window so the item works.
+pub const OPEN_THEME_EDITOR_ACTION: &str = "open-theme-editor";
+
+/// Full action path used in Gio.Menu models (`win.` + [`OPEN_THEME_EDITOR_ACTION`]).
+pub const OPEN_THEME_EDITOR_MENU_ACTION: &str = "win.open-theme-editor";
+
+/// Sentinel id appended by [`build_profile_dropdown`] for the "Custom…" row.
+pub const CUSTOM_EDITOR_SENTINEL: &str = "__custom_editor__";
+
+/// Resolve the `gtk-theme-editor` binary (release → debug → PATH).
+pub fn theme_editor_path() -> Option<PathBuf> {
+    if let Ok(custom) = std::env::var("GTK_THEME_EDITOR") {
+        let p = PathBuf::from(custom);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+
+    // Suite layout: GTK-Apps/gtk-<app>/target/{release,debug}/<bin>
+    // → sibling gtk-theme-editor/target/...
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors().take(5) {
+            let base = ancestor.join("gtk-theme-editor").join("target");
+            for name in ["release/gtk-theme-editor", "debug/gtk-theme-editor"] {
+                let p = base.join(name);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+
+    // Relative to this crate when building from the monorepo.
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Some(suite) = crate_dir.parent() {
+        let base = suite.join("gtk-theme-editor").join("target");
+        for name in ["release/gtk-theme-editor", "debug/gtk-theme-editor"] {
+            let p = base.join(name);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+
+    // Fall back to PATH (e.g. if installed system-wide).
+    std::env::var_os("PATH").and_then(|paths| {
+        for dir in std::env::split_paths(&paths) {
+            let p = dir.join("gtk-theme-editor");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+        None
+    })
+}
+
+/// Spawn the suite theme editor so the user can create/edit a custom profile.
+pub fn launch_theme_editor() {
+    let Some(bin) = theme_editor_path() else {
+        eprintln!("gtk-theme: gtk-theme-editor binary not found");
+        return;
+    };
+    if let Err(e) = std::process::Command::new(&bin).spawn() {
+        eprintln!("gtk-theme: failed to launch {}: {e}", bin.display());
+    }
+}
+
+/// Install `win.open-theme-editor` on a window (idempotent).
+pub fn install_open_theme_editor_action(map: &impl IsA<gio::ActionMap>) {
+    let map = map.as_ref();
+    if map.lookup_action(OPEN_THEME_EDITOR_ACTION).is_some() {
+        return;
+    }
+    let act = gio::SimpleAction::new(OPEN_THEME_EDITOR_ACTION, None);
+    act.connect_activate(|_, _| launch_theme_editor());
+    map.add_action(&act);
+}
+
+/// Build a radio-style Profile submenu (matches the gtk-term Profile UI).
+///
+/// `action_name` should be a stateful string action, e.g. `"win.theme"`.
+/// Radio rows stay text-only so GTK can show the check indicator; the
+/// submenu parent uses a themed color icon when the menu renderer shows it.
+///
+/// Always ends with a **Custom…** item that activates
+/// [`OPEN_THEME_EDITOR_MENU_ACTION`] — install it with
+/// [`install_open_theme_editor_action`].
+pub fn append_profile_menu(parent: &gio::Menu, action_name: &str) {
+    let profiles_menu = gio::Menu::new();
+
+    let builtin_section = gio::Menu::new();
+    for profile in builtin_profiles() {
+        let item = gio::MenuItem::new(Some(profile.name), None);
+        item.set_action_and_target_value(Some(action_name), Some(&profile.id.to_variant()));
+        builtin_section.append_item(&item);
+    }
+    profiles_menu.append_section(None, &builtin_section);
+
+    // User-saved custom profiles (from the theme editor) get their own section.
+    let customs: Vec<&'static Profile> = all_profiles()
+        .into_iter()
+        .filter(|p| !builtin_profiles().iter().any(|b| b.id == p.id))
+        .collect();
+    if !customs.is_empty() {
+        let custom_section = gio::Menu::new();
+        for profile in customs {
+            let item = gio::MenuItem::new(Some(profile.name), None);
+            item.set_action_and_target_value(Some(action_name), Some(&profile.id.to_variant()));
+            custom_section.append_item(&item);
+        }
+        profiles_menu.append_section(Some("Saved"), &custom_section);
+    }
+
+    // Opens gtk-theme-editor to create / tweak a custom profile.
+    let editor_section = gio::Menu::new();
+    let custom_item = gio::MenuItem::new(Some("Custom…"), Some(OPEN_THEME_EDITOR_MENU_ACTION));
+    editor_section.append_item(&custom_item);
+    profiles_menu.append_section(None, &editor_section);
+
+    let item = gio::MenuItem::new(Some("Profile"), None);
+    item.set_submenu(Some(&profiles_menu));
+    parent.append_item(&item);
+}
+
+/// Drop-down of profile display names, plus a trailing **Custom…** row that
+/// launches the theme editor (selection snaps back to the previous profile).
+///
+/// Returns `(dropdown, profile ids in order)` — ids do **not** include the
+/// Custom sentinel; use [`profile_id_at`] when reading the selection.
+pub fn build_profile_dropdown(current_id: &str) -> (gtk::DropDown, Vec<&'static str>) {
+    let profiles = all_profiles();
+    let ids: Vec<&'static str> = profiles.iter().map(|p| p.id).collect();
+    let mut labels: Vec<&str> = profiles.iter().map(|p| p.name).collect();
+    labels.push("Custom…");
+    let model = gtk::StringList::new(&labels);
+    let drop = gtk::DropDown::new(Some(model), None::<gtk::Expression>);
+    let idx = ids.iter().position(|id| *id == current_id).unwrap_or(0) as u32;
+    drop.set_selected(idx);
+
+    // Selecting "Custom…" opens the editor and restores the prior profile row.
+    let last = std::cell::Cell::new(idx);
+    let custom_row = ids.len() as u32;
+    drop.connect_selected_notify(move |dd| {
+        let sel = dd.selected();
+        if sel == custom_row {
+            dd.set_selected(last.get());
+            launch_theme_editor();
+            return;
+        }
+        last.set(sel);
+    });
+
+    (drop, ids)
+}
+
+/// Profile id for a dropdown selection, or `None` if out of range / Custom row.
+pub fn profile_id_at(ids: &[&'static str], selected: u32) -> Option<&'static str> {
+    ids.get(selected as usize).copied()
+}
+
+/// Best-effort: rewrite hyprbars colors in `~/.config/hypr/hyprland.conf` to
+/// match this profile (bar = elevated surface, text/glyphs = foreground), then
+/// push live via `hyprctl keyword`. No-op outside Hyprland.
+/// Does not `hyprctl reload` — that re-runs monitor= and rearranges displays.
+pub fn sync_hyprbars(profile: &Profile) {
+    let chrome = profile.window_chrome();
+    let _ = sync_hyprbars_chrome(&profile.surface_hex(), profile.foreground, &chrome);
+    let _ = sync_hyprtabs(profile);
+}
+
+/// Push GTK suite colors into `plugin:hyprtabs` (capsule, text, active pill).
+pub fn sync_hyprtabs(profile: &Profile) -> bool {
+    let chrome = profile.window_chrome();
+    sync_hyprtabs_chrome(
+        &profile.surface_hex(),
+        profile.background,
+        profile.foreground,
+        &chrome,
+    )
+}
+
+fn sync_hyprtabs_chrome(
+    surface_hex: &str,
+    background_hex: &str,
+    text_hex: &str,
+    chrome: &WindowChrome,
+) -> bool {
+    // Capsule ≈ Waybar panel bg at ~75% alpha (50% vanished into dark wallpapers).
+    let Some(bar_rgba) = hex_to_hypr_rgba(background_hex, "c0") else {
+        return false;
+    };
+    let Some(text_rgb) = hex_to_hypr_rgb(text_hex) else {
+        return false;
+    };
+    // Active pill ≈ Waybar selected: foreground fill, background label.
+    let (active_hex, active_text_hex) = if relative_luminance(text_hex) >= 0.45 {
+        let at = if relative_luminance(background_hex) < 0.45 {
+            background_hex.to_string()
+        } else {
+            "#111111".to_string()
+        };
+        (text_hex.to_string(), at)
+    } else {
+        let mut pill = mix_hex(surface_hex, "#ffffff", 0.55);
+        if relative_luminance(&pill) < 0.35 {
+            pill = mix_hex(surface_hex, "#ffffff", 0.72);
+        }
+        (pill, text_hex.to_string())
+    };
+    let Some(active_rgba) = hex_to_hypr_rgba(&active_hex, "ff") else {
+        return false;
+    };
+    let Some(active_text_rgb) = hex_to_hypr_rgb(&active_text_hex) else {
+        return false;
+    };
+    let font = chrome_bar_font(chrome);
+
+    if let Some(path) = hyprland_conf_path() {
+        if let Ok(original) = std::fs::read_to_string(&path) {
+            let out = rewrite_hyprtabs_assigns(
+                &original,
+                &[
+                    ("bar_color", bar_rgba.as_str()),
+                    ("col.text", text_rgb.as_str()),
+                    ("tab_active_color", active_rgba.as_str()),
+                    ("tab_active_text_color", active_text_rgb.as_str()),
+                    ("bar_text_font", font),
+                ],
+            );
+            if out != original {
+                let _ = std::fs::write(&path, out);
+            }
+        }
+    }
+
+    if !theme_session_safe() {
+        hyprctl_keyword("plugin:hyprtabs:bar_color", &bar_rgba);
+        hyprctl_keyword("plugin:hyprtabs:col.text", &text_rgb);
+        hyprctl_keyword("plugin:hyprtabs:tab_active_color", &active_rgba);
+        hyprctl_keyword("plugin:hyprtabs:tab_active_text_color", &active_text_rgb);
+        hyprctl_keyword("plugin:hyprtabs:bar_text_font", font);
+    }
+    true
+}
+
+fn rewrite_hyprtabs_assigns(text: &str, assigns: &[(&str, &str)]) -> String {
+    let mut out = String::new();
+    let mut in_tabs = false;
+    let mut depth: i32 = 0;
+    let mut seen: Vec<&str> = Vec::new();
+    let mut insert_indent = "        ".to_string();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        let indent = &line[..indent_len];
+        if !in_tabs && trimmed.starts_with("hyprtabs") {
+            in_tabs = true;
+            depth = 0;
+            seen.clear();
+            out.push_str(line);
+            out.push('\n');
+            depth += trimmed.matches('{').count() as i32 - trimmed.matches('}').count() as i32;
+            continue;
+        }
+        if in_tabs {
+            depth += trimmed.matches('{').count() as i32 - trimmed.matches('}').count() as i32;
+            if depth <= 0 {
+                for (key, value) in assigns {
+                    if !seen.iter().any(|s| s == key) {
+                        out.push_str(&insert_indent);
+                        out.push_str(key);
+                        out.push_str(" = ");
+                        out.push_str(value);
+                        out.push('\n');
+                    }
+                }
+                in_tabs = false;
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            let mut replaced = false;
+            for (key, value) in assigns {
+                if trimmed.starts_with(&format!("{key} =")) || trimmed.starts_with(&format!("{key}="))
+                {
+                    out.push_str(indent);
+                    out.push_str(key);
+                    out.push_str(" = ");
+                    out.push_str(value);
+                    out.push('\n');
+                    if !seen.iter().any(|s| s == key) {
+                        seen.push(*key);
+                    }
+                    if !indent.is_empty() {
+                        insert_indent = indent.to_string();
+                    }
+                    replaced = true;
+                    break;
+                }
+            }
+            if !replaced {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !text.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Same as [`sync_hyprbars`] for arbitrary hex colors (`#rrggbb`).
+pub fn sync_hyprbars_colors(bar_hex: &str, text_hex: &str) -> bool {
+    sync_hyprbars_chrome(bar_hex, text_hex, &WindowChrome::default())
+}
+
+fn sync_hyprbars_chrome(bar_hex: &str, text_hex: &str, chrome: &WindowChrome) -> bool {
+    let [bar0, bar1] = chrome.bar_stops(bar_hex, text_hex);
+    let [ibar0, ibar1] = chrome.bar_inactive_stops(bar_hex, bar_hex);
+    let Some(bar_rgb) = hex_to_hypr_rgb(&bar0) else {
+        return false;
+    };
+    let Some(bar2_rgb) = hex_to_hypr_rgb(&bar1) else {
+        return false;
+    };
+    let Some(ibar_rgb) = hex_to_hypr_rgb(&ibar0) else {
+        return false;
+    };
+    let Some(ibar2_rgb) = hex_to_hypr_rgb(&ibar1) else {
+        return false;
+    };
+    let Some(text_rgb) = hex_to_hypr_rgb(text_hex) else {
+        return false;
+    };
+    let bar_rgba = format!("rgba({}ff)", &bar_rgb[4..10]);
+    let bar2_rgba = format!("rgba({}ff)", &bar2_rgb[4..10]);
+    let ibar_rgba = format!("rgba({}ff)", &ibar_rgb[4..10]);
+    let ibar2_rgba = format!("rgba({}ff)", &ibar2_rgb[4..10]);
+    let dir = chrome.gradient.as_id();
+    let btn_size = chrome.buttons.size.to_string();
+    let font = chrome_bar_font(chrome);
+    if chrome.buttons.kit == "nerd" {
+        ensure_symbols_nerd_font();
+    }
+
+    // 1) Persist so the next login / reload keeps the colors.
+    if let Some(path) = hyprland_conf_path() {
+        if let Ok(original) = std::fs::read_to_string(&path) {
+            let mut out = original.clone();
+            out = replace_hypr_assign(&out, "bar_color", &bar_rgba);
+            out = replace_or_insert_hypr_assign(&out, "bar_color2", &bar2_rgba, "bar_color");
+            out =
+                replace_or_insert_hypr_assign(&out, "bar_color_inactive", &ibar_rgba, "bar_color2");
+            out = replace_or_insert_hypr_assign(
+                &out,
+                "bar_color_inactive2",
+                &ibar2_rgba,
+                "bar_color_inactive",
+            );
+            out = replace_or_insert_hypr_assign(&out, "bar_gradient", dir, "bar_color_inactive2");
+            out = replace_hypr_assign(&out, "col.text", &text_rgb);
+            out = replace_hypr_assign(&out, "inactive_button_color", &ibar_rgb);
+            out = replace_hypr_assign(&out, "bar_text_font", font);
+            out = rewrite_hyprbars_buttons(&out, &bar_rgb, &text_rgb, &btn_size, &chrome.buttons);
+            if out != original {
+                let _ = std::fs::write(&path, out);
+            }
+        }
+    }
+
+    // 2) Live update (no full compositor restart). Neuronix hyprbars replaces
+    //    hyprbars-button rows that share the same action, so keywords are safe.
+    //    Title-bar gradient uses a dispatcher because new plugin: keys are not
+    //    keyword-addressable until a config reload (which we must not do).
+    if !theme_session_safe() {
+        hyprctl_keyword("plugin:hyprbars:bar_color", &bar_rgba);
+        hyprctl_keyword("plugin:hyprbars:col.text", &text_rgb);
+        hyprctl_keyword("plugin:hyprbars:inactive_button_color", &ibar_rgb);
+        hyprctl_keyword("plugin:hyprbars:bar_text_font", font);
+        apply_hyprbars_fill(&bar_rgba, &bar2_rgba, &ibar_rgba, &ibar2_rgba, dir);
+        apply_hyprbars_button_keywords(&bar_rgb, &text_rgb, chrome);
+    }
+    true
+}
+
+fn chrome_bar_font(chrome: &WindowChrome) -> &'static str {
+    if chrome.buttons.kit == "nerd" {
+        "Symbols Nerd Font"
+    } else {
+        "DejaVu Sans"
+    }
+}
+
+fn ensure_symbols_nerd_font() {
+    let dests: Vec<PathBuf> = [
+        dirs::data_local_dir().map(|d| d.join("fonts/SymbolsNerdFont-Regular.ttf")),
+        Some(PathBuf::from(
+            "/usr/local/share/fonts/truetype/nerd-fonts/SymbolsNerdFont-Regular.ttf",
+        )),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if dests.iter().any(|p| p.is_file()) {
+        return;
+    }
+    let srcs = [
+        PathBuf::from("/usr/local/share/fonts/truetype/nerd-fonts/SymbolsNerdFont-Regular.ttf"),
+        PathBuf::from("/usr/share/fonts/truetype/nerd-fonts/SymbolsNerdFont-Regular.ttf"),
+        PathBuf::from("/usr/share/neuronix/fonts/SymbolsNerdFont-Regular.ttf"),
+    ];
+    let Some(src) = srcs.into_iter().find(|p| p.is_file()) else {
+        return;
+    };
+    if let Some(dest) = dirs::data_local_dir().map(|d| d.join("fonts/SymbolsNerdFont-Regular.ttf"))
+    {
+        if let Some(parent) = dest.parent() {
+            let _ = std::fs::create_dir_all(parent);
+            if std::fs::copy(&src, &dest).is_ok() {
+                let _ = std::process::Command::new("fc-cache")
+                    .args(["-f", parent.to_string_lossy().as_ref()])
+                    .status();
+            }
+        }
+    }
+}
+
+fn apply_hyprbars_button_keywords(bar_rgb: &str, text_rgb: &str, chrome: &WindowChrome) {
+    if let Some(path) = hyprland_conf_path() {
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let mut any = false;
+            for line in text.lines() {
+                let trimmed = line.trim_start();
+                if let Some(rest) = trimmed.strip_prefix("hyprbars-button") {
+                    let value = rest.trim_start().trim_start_matches('=').trim();
+                    if !value.is_empty() {
+                        hyprctl_keyword("plugin:hyprbars:hyprbars-button", value);
+                        any = true;
+                    }
+                }
+            }
+            if any {
+                return;
+            }
+        }
+    }
+    let size = chrome.buttons.size.to_string();
+    for (icon, action) in [
+        (chrome.buttons.close.as_str(), "hyprctl dispatch killactive"),
+        (
+            chrome.buttons.maximize.as_str(),
+            "hyprctl dispatch fullscreen 1",
+        ),
+        // Decorative only — minimize / special:minimized was removed.
+        (chrome.buttons.minimize.as_str(), "true"),
+    ] {
+        hyprctl_keyword(
+            "plugin:hyprbars:hyprbars-button",
+            &format!("{bar_rgb}, {size}, {icon}, {action}, {text_rgb}"),
+        );
+    }
+}
+
+fn hyprland_conf_path() -> Option<PathBuf> {
+    hypr_conf_paths()
+        .into_iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "hyprland.conf"))
+}
+
+/// `hyprland.conf` plus `binds-personal.conf` (this workstation's 10px outline
+/// lives in the latter and would otherwise override the base file).
+fn hypr_conf_paths() -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let dirs = [
+        dirs::config_dir().map(|d| d.join("hypr")),
+        dirs::home_dir().map(|d| d.join("configs/hypr")),
+    ];
+    for dir in dirs.into_iter().flatten() {
+        for name in ["hyprland.conf", "binds-personal.conf"] {
+            let path = dir.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if seen.insert(key) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn hex_to_hypr_rgb(hex: &str) -> Option<String> {
+    let (r, g, b) = parse_rgb(hex)?;
+    Some(format!("rgb({r:02x}{g:02x}{b:02x})"))
+}
+
+fn replace_hypr_assign(text: &str, key: &str, value: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 32);
+    let prefix = format!("{key} =");
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(&prefix) || trimmed.starts_with(&format!("{key}=")) {
+            let indent_len = line.len() - trimmed.len();
+            let indent = &line[..indent_len];
+            out.push_str(indent);
+            out.push_str(key);
+            out.push_str(" = ");
+            out.push_str(value);
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !text.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn hypr_key_present(text: &str, key: &str) -> bool {
+    let prefix = format!("{key} =");
+    let prefix2 = format!("{key}=");
+    text.lines().any(|line| {
+        let t = line.trim_start();
+        t.starts_with(&prefix) || t.starts_with(&prefix2)
+    })
+}
+
+/// Replace `key =` if present; otherwise insert a line immediately after `after_key`.
+fn replace_or_insert_hypr_assign(text: &str, key: &str, value: &str, after_key: &str) -> String {
+    if hypr_key_present(text, key) {
+        return replace_hypr_assign(text, key, value);
+    }
+    let mut out = String::with_capacity(text.len() + 64);
+    let after = format!("{after_key} =");
+    let after2 = format!("{after_key}=");
+    let mut inserted = false;
+    for line in text.lines() {
+        out.push_str(line);
+        out.push('\n');
+        if inserted {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(&after) || trimmed.starts_with(&after2) {
+            let indent_len = line.len() - trimmed.len();
+            out.push_str(&line[..indent_len]);
+            out.push_str(key);
+            out.push_str(" = ");
+            out.push_str(value);
+            out.push('\n');
+            inserted = true;
+        }
+    }
+    if !inserted {
+        out.push_str(key);
+        out.push_str(" = ");
+        out.push_str(value);
+        out.push('\n');
+    }
+    if !text.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn rewrite_hyprbars_buttons(
+    text: &str,
+    bar_rgb: &str,
+    text_rgb: &str,
+    size: &str,
+    buttons: &ChromeButtons,
+) -> String {
+    let mut out = String::with_capacity(text.len() + 32);
+    for line in text.lines() {
+        if line.trim_start().starts_with("hyprbars-button") {
+            out.push_str(&rewrite_one_hyprbars_button(
+                line, bar_rgb, text_rgb, size, buttons,
+            ));
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !text.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn rewrite_one_hyprbars_button(
+    line: &str,
+    bar_rgb: &str,
+    text_rgb: &str,
+    size: &str,
+    buttons: &ChromeButtons,
+) -> String {
+    let indent_len = line.len() - line.trim_start().len();
+    let indent = &line[..indent_len];
+    let trimmed = line.trim_start();
+    let Some(eq) = trimmed.find('=') else {
+        return line.to_string();
+    };
+    let rest = trimmed[eq + 1..].trim();
+    let commas: Vec<usize> = rest
+        .char_indices()
+        .filter_map(|(i, c)| if c == ',' { Some(i) } else { None })
+        .collect();
+    if commas.len() < 3 {
+        return line.to_string();
+    }
+    let after_icon = rest[commas[2] + 1..].trim();
+    let action = {
+        let lower = after_icon.to_ascii_lowercase();
+        if let Some(idx) = lower
+            .rfind(", rgb(")
+            .or_else(|| lower.rfind(",rgba("))
+            .or_else(|| lower.rfind(",rgb("))
+        {
+            after_icon[..idx].trim()
+        } else {
+            after_icon
+        }
+    };
+    let icon = buttons.glyph_for_action(action);
+    format!("{indent}hyprbars-button = {bar_rgb}, {size}, {icon}, {action}, {text_rgb}")
+}
+
+fn hypr_instance_signature() -> Option<String> {
+    if let Ok(sig) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
+        if !sig.is_empty() {
+            return Some(sig);
+        }
+    }
+    let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
+    let dir = runtime.join("hypr");
+    let mut entries: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    entries
+        .into_iter()
+        .rev()
+        .find(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+}
+
+fn hyprctl_cmd() -> std::process::Command {
+    let mut cmd = std::process::Command::new("hyprctl");
+    if let Some(sig) = hypr_instance_signature() {
+        cmd.env("HYPRLAND_INSTANCE_SIGNATURE", sig);
+    }
+    cmd
+}
+
+fn hyprctl_quiet(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+}
+
+fn hyprctl_keyword(key: &str, value: &str) {
+    let _ = hyprctl_quiet(hyprctl_cmd().args(["keyword", key, value])).status();
+}
+
+fn hyprctl_dispatch(name: &str, args: &str) {
+    let _ = hyprctl_quiet(hyprctl_cmd().args(["dispatch", name, args])).status();
+}
+
+fn apply_hyprbars_fill(c1: &str, c2: &str, i1: &str, i2: &str, dir: &str) {
+    let args = format!("{c1} {c2} {i1} {i2} {dir}");
+    let _ = hyprctl_quiet(hyprctl_cmd().args(["hyprbarsfill", &args])).status();
+    hyprctl_dispatch("hyprbarsgradient", &args);
+}
+
+#[allow(dead_code)] // kept for session-start safety comments; theme apply must not reload
+fn hyprctl_reload() {
+    // Session start sets this so we never `hyprctl reload` while plugins/portals
+    // are still coming up (that freezes Hyprland on logout→login).
+    if theme_session_safe() {
+        return;
+    }
+    let _ = hyprctl_quiet(hyprctl_cmd().arg("reload")).status();
+}
+
+fn theme_session_safe() -> bool {
+    std::env::var_os("NEURONIX_THEME_NO_HYPR_RELOAD").is_some()
+}
+
+/// True when the Hyprland hyprbars plugin is loaded (titlebar − □ ×).
+pub fn hyprbars_active() -> bool {
+    if hypr_instance_signature().is_none() {
+        return false;
+    }
+    let Ok(out) = hyprctl_cmd()
+        .args(["plugin", "list"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .to_ascii_lowercase()
+        .contains("plugin hyprbars")
+}
+
+/// Prefer hiding GTK headerbar close/min/max when hyprbars owns those controls.
+pub fn headerbar_show_title_buttons() -> bool {
+    !hyprbars_active()
+}
+
+/// Apply suite defaults to a headerbar (hide CSD buttons under hyprbars).
+pub fn prepare_headerbar(header: &gtk::HeaderBar) {
+    header.set_show_title_buttons(headerbar_show_title_buttons());
+}
+
+/// Best-effort: restyle Waybar / mako / fuzzel / Hyprland window borders to the
+/// active profile (bg / fg / surface_alt border), then reload those clients.
+/// Also writes user GTK3/GTK4 CSS so zenity (Choose background) matches,
+/// and regenerates `~/.themes/neuronix` (GTK4 pavucontrol and other system apps).
+///
+/// Always rewrites known config paths (both `~/.config` and `~/configs`) and
+/// hard-restarts Waybar so a profile switch cannot leave a stale bar on screen.
+pub fn sync_shell_chrome(profile: &Profile) {
+    let bg = profile.background;
+    let fg = profile.foreground;
+    let border = profile.surface_alt_hex();
+    let surface = profile.surface_hex();
+    let accent = profile.accent();
+    let [inactive0, inactive1] = profile.border_inactive_stops();
+    let chrome = profile.window_chrome();
+    sync_waybar_style(bg, fg, &border, &surface, &inactive0, &inactive1);
+    sync_mako_colors(bg, fg, &border);
+    // Fuzzel chrome matches window inactive border + Hypr rounding.
+    sync_fuzzel_colors(
+        bg,
+        fg,
+        &inactive0,
+        &surface,
+        accent,
+        chrome.border_size,
+        chrome.rounding,
+    );
+    if let (Some(active), Some(inactive)) =
+        (profile.hypr_active_border(), profile.hypr_inactive_border())
+    {
+        sync_hypr_window_borders(&active, &inactive, &profile.border_hex());
+    }
+    sync_hypr_window_geometry(chrome.border_size, chrome.rounding);
+    sync_hypr_workspace_background(bg);
+    sync_gtk_term_colors(profile);
+    sync_gtk_user_css(profile);
+    // File pickers / Power Manager cache GTK CSS — restart on profile change.
+    // During session start skip: portal + waybar bring-up already races Hyprland.
+    if !theme_session_safe() {
+        restart_system_dialogs();
+    }
+}
+
+fn restart_system_dialogs() {
+    let relaunch_power = std::process::Command::new("pgrep")
+        .args(["-f", "xfce4-power-manager-settings"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    for args in [
+        ["-x", "zenity"],
+        ["-f", "xdg-desktop-portal-gtk"],
+        ["-f", "xfce4-power-manager-settings"],
+    ] {
+        let _ = std::process::Command::new("pkill")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "restart", "xdg-desktop-portal-gtk.service"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if relaunch_power {
+        let _ = std::process::Command::new("xfce4-power-manager-settings")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
+/// Full desktop reset used by [`select_theme`]: in-process chrome is applied
+/// separately; this pushes Hyprland + shell + system GTK dialog colors.
+pub fn sync_desktop_theme(profile: &Profile) {
+    sync_hyprbars(profile); // also syncs hyprtabs
+    sync_shell_chrome(profile);
+}
+
+/// Live-update the Hyprland window outline from an in-progress editor profile
+/// (hyprctl only; configs are written on Apply via [`sync_shell_chrome`]).
+pub fn preview_window_border(data: &ProfileData) {
+    if let (Some(active), Some(inactive)) = (data.hypr_active_border(), data.hypr_inactive_border())
+    {
+        apply_hypr_window_border_keywords(&active, &inactive);
+    }
+    let chrome = data.chrome_or_default();
+    if !theme_session_safe() {
+        hyprctl_keyword("general:border_size", &chrome.border_size.to_string());
+        hyprctl_keyword("decoration:rounding", &chrome.rounding.to_string());
+        preview_hyprbars_fill(data, &chrome);
+    }
+}
+
+fn preview_hyprbars_fill(data: &ProfileData, chrome: &WindowChrome) {
+    let surface = mix_hex(&data.background, &data.foreground, 0.10);
+    let [b0, b1] = chrome.bar_stops(&surface, &data.foreground);
+    let [i0, i1] = chrome.bar_inactive_stops(&surface, &data.background);
+    let Some(c0) = hex_to_hypr_rgba(&b0, "ff") else {
+        return;
+    };
+    let Some(c1) = hex_to_hypr_rgba(&b1, "ff") else {
+        return;
+    };
+    let Some(ic0) = hex_to_hypr_rgba(&i0, "ff") else {
+        return;
+    };
+    let Some(ic1) = hex_to_hypr_rgba(&i1, "ff") else {
+        return;
+    };
+    hyprctl_keyword("plugin:hyprbars:bar_color", &c0);
+    apply_hyprbars_fill(&c0, &c1, &ic0, &ic1, chrome.gradient.as_id());
+}
+
+fn config_candidates(rel: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(d) = dirs::config_dir() {
+        out.push(d.join(rel));
+    }
+    if let Some(h) = dirs::home_dir() {
+        out.push(h.join("configs").join(rel));
+    }
+    out
+}
+
+fn existing_config_paths(rel: &str) -> Vec<PathBuf> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut paths = Vec::new();
+    for p in config_candidates(rel) {
+        if !p.is_file() {
+            continue;
+        }
+        let key = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+        if seen.insert(key) {
+            paths.push(p);
+        }
+    }
+    paths
+}
+
+fn css_rgba(hex: &str, alpha: f32) -> String {
+    let (r, g, b) = parse_rgb(hex).unwrap_or((0, 0, 0));
+    format!("rgba({r}, {g}, {b}, {alpha:.2})")
+}
+
+fn waybar_vars_block(
+    fg: &str,
+    bg: &str,
+    surface: &str,
+    inactive0: &str,
+    inactive1: &str,
+) -> String {
+    let dim = mix_hex(fg, surface, 0.35);
+    let muted = mix_hex(fg, surface, 0.15);
+    let hover = css_rgba(surface, 0.45);
+    format!(
+        r#"{WAYBAR_VARS_BEGIN}
+@define-color wb_fg {fg};
+@define-color wb_bg {bg};
+@define-color wb_surface {surface};
+@define-color wb_dim {dim};
+@define-color wb_muted {muted};
+@define-color wb_inactive0 {inactive0};
+@define-color wb_inactive1 {inactive1};
+@define-color wb_hover {hover};
+{WAYBAR_VARS_END}
+"#
+    )
+}
+
+fn waybar_gtk_color_refs(css: &str) -> String {
+    css.replace("var(--wb-fg)", "@wb_fg")
+        .replace("var(--wb-bg)", "@wb_bg")
+        .replace("var(--wb-surface)", "@wb_surface")
+        .replace("var(--wb-dim)", "@wb_dim")
+        .replace("var(--wb-muted)", "@wb_muted")
+        .replace("var(--wb-inactive0)", "@wb_inactive0")
+        .replace("var(--wb-inactive1)", "@wb_inactive1")
+        .replace("var(--wb-hover)", "@wb_hover")
+}
+
+fn sync_waybar_style(
+    bg: &str,
+    fg: &str,
+    _border: &str,
+    surface: &str,
+    inactive0: &str,
+    inactive1: &str,
+) {
+    let paths = existing_config_paths("waybar/style.css");
+    if paths.is_empty() {
+        return;
+    }
+    let block = waybar_vars_block(fg, bg, surface, inactive0, inactive1);
+    for path in &paths {
+        let Ok(original) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let mut out = upsert_css_markers(&original, &block, WAYBAR_VARS_BEGIN, WAYBAR_VARS_END);
+        out = waybar_gtk_color_refs(&out);
+        if !original.contains("@define-color wb_fg") || original.contains("var(--wb-") {
+            out = rewrite_waybar_window_block_vars(&out);
+            out = rewrite_waybar_active_workspace_vars(&out);
+            out = promote_waybar_hardcoded_to_vars(&out);
+            out = waybar_gtk_color_refs(&out);
+        }
+        if out != original {
+            let _ = std::fs::write(path, &out);
+        }
+    }
+    restart_waybar();
+}
+
+#[allow(dead_code)]
+fn rewrite_waybar_global_colors(css: &str, fg: &str, surface: &str) -> String {
+    // Keep module text readable when switching light ↔ dark. Rewrite common
+    // hard-coded greys from the stock Neuronix stylesheet.
+    let mut out = String::with_capacity(css.len() + 32);
+    for line in css.lines() {
+        let trimmed = line.trim();
+        let replaced = if trimmed == "color: #f5f5f5;"
+            || trimmed == "color: #ffffff;"
+            || trimmed == "color: #cccccc;"
+            || trimmed == "color: #888888;"
+        {
+            // Dim inactive modules slightly from fg.
+            let dim = if trimmed.contains("#888888") {
+                mix_hex(fg, surface, 0.35)
+            } else if trimmed.contains("#cccccc") {
+                mix_hex(fg, surface, 0.15)
+            } else {
+                fg.to_string()
+            };
+            let indent_len = line.len() - line.trim_start().len();
+            format!("{}color: {dim};", &line[..indent_len])
+        } else if trimmed.starts_with("background: #2e2e2e")
+            || trimmed.starts_with("background-color: #2e2e2e")
+            || trimmed.starts_with("background: #0a0a0a")
+        {
+            let indent_len = line.len() - line.trim_start().len();
+            let prop = if trimmed.starts_with("background-color") {
+                "background-color"
+            } else {
+                "background"
+            };
+            format!("{}{prop}: {surface};", &line[..indent_len])
+        } else {
+            line.to_string()
+        };
+        out.push_str(&replaced);
+        out.push('\n');
+    }
+    if !css.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn restart_waybar() {
+    // Hyprland starts waybar as a session child. The distro user unit requires
+    // graphical-session.target (inactive here), so systemctl restart fails and
+    // a follow-up killall leaves the bar dead.
+    let alive = std::process::Command::new("pgrep")
+        .args(["-x", "waybar"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if alive {
+        let _ = std::process::Command::new("killall")
+            .args(["-SIGUSR2", "waybar"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        return;
+    }
+    let via_hypr = std::process::Command::new("hyprctl")
+        .args(["dispatch", "exec", "waybar"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if via_hypr {
+        return;
+    }
+    let _ = std::process::Command::new("waybar")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+fn rewrite_css_selector_block(css: &str, selector: &str, body: &str) -> String {
+    let Some(start) = css.find(selector) else {
+        return css.to_string();
+    };
+    let after = &css[start..];
+    let Some(brace) = after.find('{') else {
+        return css.to_string();
+    };
+    let Some(end_rel) = after[brace..].find('}') else {
+        return css.to_string();
+    };
+    let end = start + brace + end_rel + 1;
+    let block = format!("{selector} {{\n{body}\n}}");
+    format!("{}{}{}", &css[..start], block, &css[end..])
+}
+
+fn rewrite_waybar_window_block_vars(css: &str) -> String {
+    rewrite_css_selector_block(
+        css,
+        "window#waybar",
+        "  background-color: @wb_bg;\n  color: @wb_fg;\n  border-bottom: none;\n  padding-bottom: 10px;\n  background-image: linear-gradient(\n    90deg,\n    @wb_inactive1 0%,\n    @wb_inactive0 50%,\n    @wb_inactive1 100%\n  );\n  background-size: 100% 10px;\n  background-position: left bottom;\n  background-repeat: no-repeat;",
+    )
+}
+
+fn rewrite_waybar_active_workspace_vars(css: &str) -> String {
+    rewrite_css_selector_block(
+        css,
+        "#workspaces button.active",
+        "  color: @wb_fg;\n  background: @wb_surface;",
+    )
+}
+
+fn promote_waybar_hardcoded_to_vars(css: &str) -> String {
+    let mut out = String::with_capacity(css.len() + 32);
+    for line in css.lines() {
+        let trimmed = line.trim();
+        let replaced = if trimmed == "color: #f5f5f5;" || trimmed == "color: #ffffff;" {
+            let indent_len = line.len() - line.trim_start().len();
+            format!("{}color: @wb_fg;", &line[..indent_len])
+        } else if trimmed == "color: #cccccc;" {
+            let indent_len = line.len() - line.trim_start().len();
+            format!("{}color: @wb_muted;", &line[..indent_len])
+        } else if trimmed == "color: #888888;" {
+            let indent_len = line.len() - line.trim_start().len();
+            format!("{}color: @wb_dim;", &line[..indent_len])
+        } else if trimmed.starts_with("background: #2e2e2e")
+            || trimmed.starts_with("background-color: #2e2e2e")
+            || trimmed.starts_with("background: #0a0a0a")
+        {
+            let indent_len = line.len() - line.trim_start().len();
+            let prop = if trimmed.starts_with("background-color") {
+                "background-color"
+            } else {
+                "background"
+            };
+            format!("{}{prop}: @wb_surface;", &line[..indent_len])
+        } else {
+            line.to_string()
+        };
+        out.push_str(&replaced);
+        out.push('\n');
+    }
+    if !css.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn sync_mako_colors(bg: &str, fg: &str, border: &str) {
+    let progress = mix_hex(fg, bg, 0.55);
+    for path in existing_config_paths("mako/config") {
+        let Ok(original) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut out = original.clone();
+        out = replace_ini_assign(&out, "background-color", bg);
+        out = replace_ini_assign(&out, "text-color", fg);
+        out = replace_ini_assign(&out, "border-color", border);
+        out = replace_ini_assign(&out, "progress-color", &progress);
+        if out != original {
+            let _ = std::fs::write(&path, out);
+        }
+    }
+    let _ = std::process::Command::new("makoctl")
+        .arg("reload")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+fn replace_ini_assign(text: &str, key: &str, value: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let prefix = format!("{key}=");
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(&prefix) {
+            let indent_len = line.len() - trimmed.len();
+            out.push_str(&line[..indent_len]);
+            out.push_str(key);
+            out.push('=');
+            out.push_str(value);
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !text.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Replace `key=value` only inside `[section]` (avoids clobbering e.g. main width).
+fn replace_ini_section_assign(text: &str, section: &str, key: &str, value: &str) -> String {
+    let header = format!("[{section}]");
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut in_section = false;
+    let prefix = format!("{key}=");
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_section = trimmed == header;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let trimmed_start = line.trim_start();
+        if in_section && trimmed_start.starts_with(&prefix) {
+            let indent_len = line.len() - trimmed_start.len();
+            out.push_str(&line[..indent_len]);
+            out.push_str(key);
+            out.push('=');
+            out.push_str(value);
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !text.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+fn sync_fuzzel_colors(
+    bg: &str,
+    fg: &str,
+    border: &str,
+    surface: &str,
+    accent: &str,
+    border_size: u32,
+    rounding: u32,
+) {
+    let bare = |h: &str| -> String {
+        let t = h.trim_start_matches('#');
+        if t.len() == 6 {
+            format!("{t}ff")
+        } else {
+            t.to_string()
+        }
+    };
+    let bg_a = format!("{}f2", bg.trim_start_matches('#'));
+    let width = border_size.to_string();
+    let radius = rounding.to_string();
+    for path in existing_config_paths("fuzzel/fuzzel.ini") {
+        let Ok(original) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut out = original.clone();
+        out = replace_ini_assign(&out, "background", &bg_a);
+        out = replace_ini_assign(&out, "text", &bare(fg));
+        out = replace_ini_assign(&out, "border", &bare(border));
+        out = replace_ini_assign(&out, "selection", &bare(surface));
+        out = replace_ini_assign(&out, "selection-text", &bare(fg));
+        out = replace_ini_assign(&out, "match", &bare(accent));
+        out = replace_ini_assign(&out, "selection-match", &bare(accent));
+        out = replace_ini_section_assign(&out, "border", "width", &width);
+        out = replace_ini_section_assign(&out, "border", "radius", &radius);
+        if out != original {
+            let _ = std::fs::write(&path, out);
+        }
+    }
+}
+
+fn sync_hypr_window_borders(active: &str, inactive: &str, panel_hex: &str) {
+    let panel = hex_to_hypr_rgba(panel_hex, "ff");
+    for path in hypr_conf_paths() {
+        if let Ok(original) = std::fs::read_to_string(&path) {
+            let mut out = original.clone();
+            out = replace_hypr_assign(&out, "col.active_border", active);
+            out = replace_hypr_assign(&out, "col.inactive_border", inactive);
+            if let Some(panel) = &panel {
+                out = replace_hypr_assign(&out, "panelBorderColor", panel);
+                out = replace_hypr_assign(&out, "workspaceInactiveBorder", panel);
+            }
+            if out != original {
+                let _ = std::fs::write(&path, out);
+            }
+        }
+    }
+    apply_hypr_window_border_keywords(active, inactive);
+}
+
+fn sync_hypr_window_geometry(border_size: u32, rounding: u32) {
+    let size = border_size.to_string();
+    let round = rounding.to_string();
+    for path in hypr_conf_paths() {
+        let Ok(original) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut out = original.clone();
+        out = replace_hypr_assign(&out, "border_size", &size);
+        out = replace_hypr_assign(&out, "rounding", &round);
+        if out != original {
+            let _ = std::fs::write(&path, out);
+        }
+    }
+    if !theme_session_safe() {
+        hyprctl_keyword("general:border_size", &size);
+        hyprctl_keyword("decoration:rounding", &round);
+    }
+}
+
+fn sync_hypr_workspace_background(bg: &str) {
+    let Some(rgb) = hex_to_hypr_rgb(bg) else {
+        return;
+    };
+    let mut wrote = false;
+    for path in hypr_conf_paths() {
+        if path.file_name().is_none_or(|n| n != "hyprland.conf") {
+            continue;
+        }
+        let Ok(original) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let out = replace_hypr_assign(&original, "background_color", &rgb);
+        if out != original {
+            if std::fs::write(&path, out).is_ok() {
+                wrote = true;
+            }
+        }
+    }
+    if wrote && !theme_session_safe() {
+        hyprctl_keyword("misc:background_color", &rgb);
+    }
+}
+
+fn gtk_term_colors_toml(profile: &Profile) -> String {
+    let pal = profile
+        .palette
+        .iter()
+        .map(|c| format!("    \"{c}\","))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "[colors]\nforeground = \"{}\"\nbackground = \"{}\"\npalette = [\n{pal}\n]\n",
+        profile.foreground, profile.background
+    )
+}
+
+fn replace_toml_table(text: &str, header: &str, body: &str) -> String {
+    if let Some(start) = text.find(header) {
+        let after = &text[start + header.len()..];
+        let rel_end = after.find("\n[").map(|i| i + 1).unwrap_or(after.len());
+        let mut out = String::new();
+        out.push_str(&text[..start]);
+        out.push_str(body.trim_end());
+        let rest = &after[rel_end..];
+        if !rest.is_empty() {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(rest);
+        } else if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out
+    } else {
+        let mut out = text.trim_end().to_string();
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(body.trim_end());
+        out.push('\n');
+        out
+    }
+}
+
+fn sync_gtk_term_colors(profile: &Profile) {
+    let body = gtk_term_colors_toml(profile);
+    for path in existing_config_paths("gtk-apps/gtk-term/config.toml") {
+        let Ok(original) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let out = replace_toml_table(&original, "[colors]", &body);
+        if out != original {
+            let _ = std::fs::write(&path, out);
+        }
+    }
+}
+
+fn apply_hypr_window_border_keywords(active: &str, inactive: &str) {
+    if theme_session_safe() {
+        return;
+    }
+    hyprctl_keyword("general:col.active_border", active);
+    hyprctl_keyword("general:col.inactive_border", inactive);
+}
+
+fn hex_digits(hex: &str) -> Option<String> {
+    let h = hex.trim_start_matches('#');
+    if h.len() == 6 && h.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(h.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn hex_to_hypr_rgba(hex: &str, alpha: &str) -> Option<String> {
+    let digits = hex_digits(hex)?;
+    Some(format!("rgba({digits}{alpha})"))
+}
+
+/// Hyprland two-stop outline. `0deg` is left→right in the border shader; RTL swaps stops.
+fn hypr_gradient(a: &str, b: &str, dir: ChromeGradient) -> Option<String> {
+    let (left, right) = match dir {
+        ChromeGradient::Ltr => (a, b),
+        ChromeGradient::Rtl => (b, a),
+    };
+    let aa = hex_to_hypr_rgba(left, "ff")?;
+    let bb = hex_to_hypr_rgba(right, "ff")?;
+    Some(format!("{aa} {bb} 0deg"))
+}
+
+const GTK_USER_CSS_BEGIN: &str = "/* BEGIN gtk-theme:shell-chrome */";
+const GTK_USER_CSS_END: &str = "/* END gtk-theme:shell-chrome */";
+const WAYBAR_VARS_BEGIN: &str = "/* BEGIN gtk-theme:waybar-vars */";
+const WAYBAR_VARS_END: &str = "/* END gtk-theme:waybar-vars */";
+/// Full GTK3/GTK4 theme under ~/.themes (THEME priority). Rewritten on profile change.
+const SHELL_GTK_THEME: &str = "neuronix";
+
+fn papirus_icon_theme(is_dark: bool) -> &'static str {
+    // Papirus action glyphs are dark (#444); Papirus-Dark is light-on-dark.
+    if is_dark {
+        "Papirus-Dark"
+    } else {
+        "Papirus"
+    }
+}
+
+/// CSS injected into `~/.config/gtk-{3,4}.0/gtk.css` so system dialogs
+/// (zenity, XFCE Power Manager, FileChooser, etc.) follow the suite profile.
+fn system_dialog_css(profile: &Profile) -> String {
+    let bg = profile.background;
+    let fg = profile.foreground;
+    let surface = profile.surface_hex();
+    let border = profile.surface_alt_hex();
+    let accent = profile.accent();
+    let on_accent = if relative_luminance(accent) < 0.55 {
+        "#fbf1c7"
+    } else {
+        "#1d2021"
+    };
+    let hover = mix_hex(bg, fg, 0.12);
+    let dim = mix_hex(fg, bg, 0.35);
+    let overrides = adwaita_accent_overrides(profile);
+    format!(
+        r#"{GTK_USER_CSS_BEGIN}
+/* Suite profile → zenity / FileChooser / XFCE Power Manager / GTK3 settings */
+@define-color theme_bg_color {bg};
+@define-color theme_fg_color {fg};
+@define-color theme_base_color {bg};
+@define-color theme_text_color {fg};
+@define-color theme_selected_bg_color {accent};
+@define-color theme_selected_fg_color {on_accent};
+@define-color theme_unfocused_selected_bg_color {accent};
+@define-color theme_unfocused_selected_fg_color {on_accent};
+@define-color insensitive_bg_color {surface};
+@define-color insensitive_fg_color {dim};
+@define-color insensitive_base_color {surface};
+@define-color borders {border};
+@define-color unfocused_borders {border};
+@define-color accent_bg_color {accent};
+@define-color accent_fg_color {on_accent};
+@define-color accent_color {accent};
+@define-color blue_3 {accent};
+
+/* Exclude DING desktop window — opaque chrome would cover the wallpaper */
+window:not(.desktopwindow),
+window.background:not(.desktopwindow),
+dialog, messagedialog,
+.background:not(.desktopwindow) {{
+  background-color: {bg};
+  background-image: none;
+  color: {fg};
+}}
+window.desktopwindow, window.desktopwindow.background {{
+  background-color: transparent;
+  background-image: none;
+}}
+headerbar, headerbar.default-decoration, .titlebar,
+headerbar:backdrop, .titlebar:backdrop {{
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+  border-bottom: 1px solid {border};
+  box-shadow: none;
+}}
+headerbar *, .titlebar * {{ color: {fg}; }}
+button {{
+  color: {fg};
+  background-color: {hover};
+  background-image: none;
+  border-color: {border};
+}}
+button:hover {{
+  background-color: {border};
+}}
+button:checked, button.suggested-action, button.suggested-action:hover,
+button.suggested-action:active {{
+  background-color: {accent};
+  background-image: none;
+  color: {on_accent};
+  border-color: {accent};
+}}
+button.suggested-action label, button:checked label {{ color: {on_accent}; }}
+*:selected, treeview:selected, treeview.view:selected,
+treeview.view:selected:focus, list row:selected, listview row:selected,
+.view:selected, .content-view:selected {{
+  background-color: {accent};
+  color: {on_accent};
+}}
+placessidebar, placessidebar list, placessidebar row,
+.sidebar, stacksidebar {{
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+  border-color: {border};
+}}
+placessidebar row:selected, .sidebar row:selected {{
+  background-color: {accent};
+  color: {on_accent};
+}}
+entry, searchbar entry, spinbutton, spinbutton entry {{
+  background-color: {bg};
+  color: {fg};
+  border-color: {border};
+}}
+filechooser, .filechooser, notebook, paned, frame, frame > border,
+scrolledwindow, viewport, .view, textview, textview text {{
+  background-color: {bg};
+  background-image: none;
+  color: {fg};
+}}
+notebook > header {{
+  background-color: {surface};
+  background-image: none;
+  border-color: {border};
+}}
+notebook > header > tabs > tab {{
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+  border-color: {border};
+  box-shadow: none;
+}}
+notebook > header > tabs > tab:hover {{
+  background-color: {hover};
+}}
+notebook > header > tabs > tab:checked {{
+  background-color: {bg};
+  color: {fg};
+  box-shadow: inset 0 -2px {accent};
+}}
+notebook > stack {{
+  background-color: {bg};
+  color: {fg};
+}}
+treeview, treeview.view, list, list row {{
+  background-color: {bg};
+  color: {fg};
+}}
+treeview header button {{
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+  border-color: {border};
+}}
+label, .label {{ color: {fg}; }}
+/* Child labels ignore row :selected color; force ink on the accent chip. */
+*:selected, *:selected *,
+row:selected, row:selected *,
+list row:selected, list row:selected *,
+listview > row:selected, listview > row:selected *,
+gridview > child:selected, gridview > child:selected *,
+columnview row:selected, columnview row:selected *,
+treeview:selected, treeview:selected *,
+treeview.view:selected, treeview.view:selected *,
+.view:selected, .view:selected *,
+.content-view:selected, .content-view:selected *,
+placessidebar row:selected, placessidebar row:selected *,
+.sidebar row:selected, .sidebar row:selected *,
+menuitem:hover, menuitem:hover *,
+modelbutton:hover, modelbutton:hover * {{
+  color: {on_accent};
+}}
+separator {{ background-color: {border}; }}
+scale trough {{
+  background-color: {border};
+  background-image: none;
+}}
+scale highlight {{
+  background-color: {accent};
+  background-image: none;
+}}
+scale slider {{
+  background-color: {accent};
+  background-image: none;
+  border-color: {accent};
+}}
+switch {{
+  background-color: {border};
+  background-image: none;
+  border-color: {border};
+}}
+switch:checked {{
+  background-color: {accent};
+  border-color: {accent};
+}}
+switch slider {{
+  background-color: {fg};
+  background-image: none;
+}}
+check, radio {{
+  background-color: {hover};
+  border-color: {border};
+  color: {on_accent};
+}}
+check:checked, radio:checked {{
+  background-color: {accent};
+  border-color: {accent};
+  color: {on_accent};
+}}
+progressbar trough {{
+  background-color: {border};
+}}
+progressbar progress {{
+  background-color: {accent};
+}}
+combobox button.combo, combobox menu {{
+  background-color: {hover};
+  color: {fg};
+  border-color: {border};
+}}
+menubar, menu, popover, popover.background {{
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+  border-color: {border};
+}}
+menuitem:hover, modelbutton:hover {{
+  background-color: {accent};
+  color: {on_accent};
+}}
+scrollbar, scrollbar contents, scrollbar trough {{
+  background-color: {bg};
+}}
+scrollbar slider {{
+  background-color: {border};
+}}
+toolbar, .primary-toolbar, .inline-toolbar {{
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+  border-color: {border};
+}}
+{overrides}
+{GTK_USER_CSS_END}
+"#
+    )
+}
+
+fn adwaita_accent_overrides(profile: &Profile) -> String {
+    let accent = profile.accent();
+    let on_accent = if relative_luminance(accent) < 0.55 {
+        "#fbf1c7"
+    } else {
+        "#1d2021"
+    };
+    let (r, g, b) = parse_rgb(accent).unwrap_or((0, 0, 0));
+    let outline = format!("rgba({r}, {g}, {b}, 0.7)");
+    format!(
+        r#"
+/* Adwaita hard-codes blues (#1b6acb / #15539e). Match those selectors. */
+switch:checked, switch:checked:hover, switch:checked:active,
+switch:backdrop:checked, switch:checked:not(:disabled) {{
+  background-color: {accent};
+  background-image: none;
+  border-color: {accent};
+  color: {on_accent};
+}}
+switch:checked > slider, switch:backdrop:checked > slider {{
+  border-color: {accent};
+}}
+notebook > header.top > tabs > tab:checked {{
+  box-shadow: inset 0 -4px {accent};
+}}
+notebook > header.bottom > tabs > tab:checked {{
+  box-shadow: inset 0 4px {accent};
+}}
+notebook > header.left > tabs > tab:checked {{
+  box-shadow: inset -4px 0 {accent};
+}}
+notebook > header.right > tabs > tab:checked {{
+  box-shadow: inset 4px 0 {accent};
+}}
+progressbar progress, scale highlight,
+progressbar progress:backdrop, scale highlight:backdrop {{
+  background-color: {accent};
+  background-image: none;
+  border-color: {accent};
+}}
+button.suggested-action, button.suggested-action:hover,
+button.suggested-action:active, button.suggested-action:backdrop {{
+  background-color: {accent};
+  background-image: none;
+  color: {on_accent};
+  border-color: {accent};
+}}
+*:link, *:visited, .link, button.link {{
+  color: {accent};
+}}
+*:selected:focus, *:selected:focus-within,
+label > selection:focus-within, entry > text > selection:focus-within {{
+  background-color: {accent};
+  color: {on_accent};
+}}
+switch:focus, switch:focus:checked, scale:focus,
+button:focus, check:focus, radio:focus {{
+  outline-color: {outline};
+}}
+"#
+    )
+}
+
+fn upsert_managed_css_block(existing: &str, block: &str) -> String {
+    upsert_css_markers(existing, block, GTK_USER_CSS_BEGIN, GTK_USER_CSS_END)
+}
+
+fn upsert_css_markers(existing: &str, block: &str, begin: &str, end: &str) -> String {
+    if let (Some(start), Some(end_rel)) = (existing.find(begin), existing.find(end)) {
+        let end = end_rel + end.len();
+        let mut out = String::new();
+        out.push_str(&existing[..start]);
+        out.push_str(block.trim_end());
+        out.push('\n');
+        let after = existing[end..].trim_start_matches(['\r', '\n']);
+        if !after.is_empty() {
+            out.push('\n');
+            out.push_str(after);
+            if !after.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        return out;
+    }
+    let mut out = existing.trim_end().to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(block.trim_end());
+    out.push('\n');
+    out
+}
+
+fn strip_managed_css_markers(block: &str) -> String {
+    format!(
+        "{}\n",
+        block
+            .replace(GTK_USER_CSS_BEGIN, "")
+            .replace(GTK_USER_CSS_END, "")
+            .trim()
+    )
+}
+
+fn upsert_ini_key(text: &str, key: &str, value: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut found = false;
+    if !text.contains("[Settings]") {
+        lines.push("[Settings]".into());
+    }
+    for line in text.lines() {
+        let stripped = line.trim_start();
+        if stripped.starts_with(&format!("{key}=")) || stripped.starts_with(&format!("{key} ")) {
+            lines.push(format!("{key}={value}"));
+            found = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !found {
+        if !lines.iter().any(|l| l.contains("[Settings]")) {
+            lines.insert(0, "[Settings]".into());
+        }
+        lines.push(format!("{key}={value}"));
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+fn upsert_xsettings_key(text: &str, key: &str, value: &str) -> String {
+    let line_out = format!("{key} \"{value}\"");
+    let mut lines: Vec<String> = Vec::new();
+    let mut found = false;
+    for line in text.lines() {
+        let stripped = line.trim_start();
+        if stripped.starts_with(&format!("{key} ")) || stripped.starts_with(&format!("{key}\t")) {
+            lines.push(line_out.clone());
+            found = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !found {
+        lines.push(line_out);
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+fn upsert_gtkrc_key(text: &str, key: &str, value: &str) -> String {
+    let line_out = format!("{key}=\"{value}\"");
+    let mut lines: Vec<String> = Vec::new();
+    let mut found = false;
+    for line in text.lines() {
+        let stripped = line.trim_start();
+        if stripped.starts_with(&format!("{key}=")) || stripped.starts_with(&format!("{key} ")) {
+            lines.push(line_out.clone());
+            found = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !found {
+        lines.push(line_out);
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+fn xfconf_set_string(prop: &str, value: &str) {
+    let exists = std::process::Command::new("xfconf-query")
+        .args(["-c", "xsettings", "-p", prop])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let mut cmd = std::process::Command::new("xfconf-query");
+    if exists {
+        cmd.args(["-c", "xsettings", "-p", prop, "-s", value]);
+    } else {
+        cmd.args([
+            "-c",
+            "xsettings",
+            "-n",
+            "-t",
+            "string",
+            "-p",
+            prop,
+            "-s",
+            value,
+        ]);
+    }
+    let _ = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+fn sync_session_icon_theme(is_dark: bool) {
+    let icons = papirus_icon_theme(is_dark);
+    for path in existing_config_paths("xsettingsd/xsettingsd.conf") {
+        if let Ok(original) = std::fs::read_to_string(&path) {
+            let out = upsert_xsettings_key(&original, "Net/IconThemeName", icons);
+            if out != original {
+                let _ = std::fs::write(&path, out);
+            }
+        }
+    }
+    let _ = std::process::Command::new("pkill")
+        .args(["-HUP", "-x", "xsettingsd"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let mut gtkrc_paths = existing_config_paths("gtkrc-2.0");
+    if let Some(home) = dirs::home_dir() {
+        gtkrc_paths.push(home.join(".gtkrc-2.0"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for path in gtkrc_paths {
+        if !path.is_file() {
+            continue;
+        }
+        let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+        if let Ok(original) = std::fs::read_to_string(&path) {
+            let out = upsert_gtkrc_key(&original, "gtk-icon-theme-name", icons);
+            if out != original {
+                let _ = std::fs::write(&path, out);
+            }
+        }
+    }
+    for path in existing_config_paths("fuzzel/fuzzel.ini") {
+        if let Ok(original) = std::fs::read_to_string(&path) {
+            let out = replace_ini_assign(&original, "icon-theme", icons);
+            if out != original {
+                let _ = std::fs::write(&path, out);
+            }
+        }
+    }
+}
+
+fn shell_theme_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join(".themes").join(SHELL_GTK_THEME));
+    }
+    if let Some(data) = dirs::data_dir() {
+        roots.push(data.join("themes").join(SHELL_GTK_THEME));
+    }
+    roots
+}
+
+fn shell_theme_index(profile: &Profile) -> String {
+    let variant = if profile.is_dark() { "dark" } else { "light" };
+    format!(
+        "[Desktop Entry]\n\
+Type=X-GNOME-Metatheme\n\
+Name=Neuronix\n\
+Comment=Generated by gtk-theme from profile {} ({variant})\n\
+Encoding=UTF-8\n\
+\n\
+[X-GNOME-Metatheme]\n\
+GtkTheme={SHELL_GTK_THEME}\n\
+MetacityTheme=Adwaita\n\
+IconTheme={}\n\
+CursorTheme=Adwaita\n\
+ButtonLayout=:minimize,maximize,close\n",
+        profile.id,
+        papirus_icon_theme(profile.is_dark())
+    )
+}
+
+fn shell_theme_gtk3_css(profile: &Profile) -> String {
+    let imported = if profile.is_dark() {
+        r#"@import url("resource:///org/gtk/libgtk/theme/Adwaita/gtk-contained-dark.css");"#
+    } else {
+        r#"@import url("resource:///org/gtk/libgtk/theme/Adwaita/gtk-contained.css");"#
+    };
+    format!(
+        "/* Generated by gtk-theme ({}) — rewritten on profile change. */\n{imported}\n\n{}",
+        profile.id,
+        strip_managed_css_markers(&system_dialog_css(profile))
+    )
+}
+
+fn shell_theme_gtk4_extra(profile: &Profile) -> String {
+    let bg = profile.background;
+    let fg = profile.foreground;
+    let surface = profile.surface_hex();
+    let border = profile.surface_alt_hex();
+    let accent = profile.accent();
+    let on_accent = if relative_luminance(accent) < 0.55 {
+        "#fbf1c7"
+    } else {
+        "#1d2021"
+    };
+    let hover = mix_hex(bg, fg, 0.12);
+    let (r, g, b) = parse_rgb(accent).unwrap_or((0, 0, 0));
+    let outline = format!("rgba({r}, {g}, {b}, 0.7)");
+    format!(
+        r#"
+/* GTK4 combinators (Adwaita Default hard-codes #15539e on scales). */
+.background {{
+  color: {fg};
+  background-color: {bg};
+}}
+.view, iconview, textview > text {{
+  color: {fg};
+  background-color: {bg};
+}}
+headerbar, headerbar.windowhandle {{
+  background-color: {surface};
+  color: {fg};
+  border-bottom-color: {border};
+}}
+progressbar > trough > progress, scale > trough > highlight {{
+  border: 1px solid {accent};
+  background-color: {accent};
+  background-image: none;
+}}
+scale > trough {{
+  background-color: {border};
+  border-color: {border};
+}}
+scale > trough > slider {{
+  background-image: none;
+  background-color: {accent};
+  border-color: {accent};
+}}
+scale > trough > slider:hover {{
+  background-image: none;
+  background-color: {hover};
+}}
+scale:focus:focus-visible > trough {{
+  outline-color: {outline};
+}}
+switch:checked {{
+  background-color: {accent};
+  border-color: {accent};
+}}
+check:checked, radio:checked,
+checkbutton > check:checked, radiobutton > radio:checked {{
+  background-color: {accent};
+  border-color: {accent};
+  color: {on_accent};
+}}
+.view:selected, .view:selected *,
+listview > row:selected, listview > row:selected *,
+gridview > child:selected, gridview > child:selected *,
+columnview row:selected, columnview row:selected *,
+row:selected, row:selected * {{
+  background-color: {accent};
+  color: {on_accent};
+}}
+"#
+    )
+}
+
+fn shell_theme_gtk4_css(profile: &Profile) -> String {
+    let imported = if profile.is_dark() {
+        r#"@import url("resource:///org/gtk/libgtk/theme/Default-dark/gtk.css");"#
+    } else {
+        r#"@import url("resource:///org/gtk/libgtk/theme/Default/gtk.css");"#
+    };
+    format!(
+        "/* Generated by gtk-theme ({}) — rewritten on profile change. */\n{imported}\n\n{}{}\n{}",
+        profile.id,
+        strip_managed_css_markers(&system_dialog_css_gtk4(profile)),
+        strip_managed_css_markers(&system_dialog_css(profile)),
+        shell_theme_gtk4_extra(profile)
+    )
+}
+
+fn sync_hypr_gtk_theme_env(is_dark: bool) {
+    let icons = papirus_icon_theme(is_dark);
+    let replacements = [
+        ("GTK_THEME", SHELL_GTK_THEME),
+        ("GTK_ICON_THEME", icons),
+        ("XDG_ICON_THEME", icons),
+    ];
+    for path in config_candidates("hypr/hyprland.conf") {
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(original) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut changed = false;
+        let mut lines = Vec::new();
+        for line in original.lines() {
+            let trimmed = line.trim_start();
+            let mut replaced = false;
+            if trimmed.starts_with("env") {
+                for (key, value) in replacements {
+                    let needle = format!("{key},");
+                    if trimmed.contains(&needle) {
+                        lines.push(format!("env = {key},{value}"));
+                        changed = true;
+                        replaced = true;
+                        break;
+                    }
+                }
+            }
+            if !replaced {
+                lines.push(line.to_string());
+            }
+        }
+        if changed {
+            let mut out = lines.join("\n");
+            if original.ends_with('\n') {
+                out.push('\n');
+            }
+            let _ = std::fs::write(&path, out);
+        }
+    }
+    std::env::set_var("GTK_THEME", SHELL_GTK_THEME);
+    std::env::set_var("GTK_ICON_THEME", icons);
+    std::env::set_var("XDG_ICON_THEME", icons);
+    let _ = std::process::Command::new("dbus-update-activation-environment")
+        .args(["--systemd", "GTK_THEME", "GTK_ICON_THEME", "XDG_ICON_THEME"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+fn sync_shell_gtk_theme(profile: &Profile) {
+    let gtk3 = shell_theme_gtk3_css(profile);
+    let gtk4 = shell_theme_gtk4_css(profile);
+    let index = shell_theme_index(profile);
+    for root in shell_theme_roots() {
+        let gtk3_dir = root.join("gtk-3.0");
+        let gtk4_dir = root.join("gtk-4.0");
+        if std::fs::create_dir_all(&gtk3_dir).is_err()
+            || std::fs::create_dir_all(&gtk4_dir).is_err()
+        {
+            continue;
+        }
+        let _ = std::fs::write(root.join("index.theme"), &index);
+        let _ = std::fs::write(gtk3_dir.join("gtk.css"), &gtk3);
+        let _ = std::fs::write(gtk4_dir.join("gtk.css"), &gtk4);
+    }
+    sync_hypr_gtk_theme_env(profile.is_dark());
+}
+
+fn sync_gtk_user_css(profile: &Profile) {
+    // GTK3 (zenity): full dialog chrome — zenity has no suite apply_chrome.
+    // GTK4: only @define-color + dialog selectors. Generic `headerbar` / `window`
+    // rules here load at STYLE_PROVIDER_PRIORITY_USER and permanently override
+    // suite chrome (USER-10) until the process restarts — that left purple
+    // headerbars after switching to a light profile.
+    // Full GTK4 chrome for pavucontrol etc. lives in ~/.themes/neuronix.
+    let gtk3 = system_dialog_css(profile);
+    let gtk4 = system_dialog_css_gtk4(profile);
+    for (ver, block) in [("gtk-3.0", gtk3.as_str()), ("gtk-4.0", gtk4.as_str())] {
+        let Some(dir) = dirs::config_dir().map(|d| d.join(ver)) else {
+            continue;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("gtk.css");
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let out = upsert_managed_css_block(&existing, block);
+        let _ = std::fs::write(&path, out);
+
+        let settings = dir.join("settings.ini");
+        let prefer = if profile.is_dark() { "1" } else { "0" };
+        let prev = std::fs::read_to_string(&settings).unwrap_or_default();
+        let mut ini = upsert_ini_key(&prev, "gtk-application-prefer-dark-theme", prefer);
+        ini = upsert_ini_key(&ini, "gtk-theme-name", SHELL_GTK_THEME);
+        ini = upsert_ini_key(
+            &ini,
+            "gtk-icon-theme-name",
+            papirus_icon_theme(profile.is_dark()),
+        );
+        ini = upsert_ini_key(&ini, "gtk-button-images", "1");
+        ini = upsert_ini_key(&ini, "gtk-menu-images", "1");
+        let _ = std::fs::write(&settings, ini);
+    }
+    sync_shell_gtk_theme(profile);
+    sync_gsettings_color_scheme(profile.is_dark());
+}
+
+/// GTK4 user CSS — libadwaita named colors + narrow dialog selectors (no
+/// generic `headerbar`/`window` rules that override suite apps).
+fn system_dialog_css_gtk4(profile: &Profile) -> String {
+    let bg = profile.background;
+    let fg = profile.foreground;
+    let surface = profile.surface_hex();
+    let border = profile.surface_alt_hex();
+    let accent = profile.accent();
+    let on_accent = if relative_luminance(accent) < 0.55 {
+        "#fbf1c7"
+    } else {
+        "#1d2021"
+    };
+    format!(
+        r#"{GTK_USER_CSS_BEGIN}
+/* Suite profile → libadwaita / zenity-4 (named colors; dialog selectors only). */
+@define-color theme_bg_color {bg};
+@define-color theme_fg_color {fg};
+@define-color theme_base_color {bg};
+@define-color theme_text_color {fg};
+@define-color theme_selected_bg_color {accent};
+@define-color theme_selected_fg_color {on_accent};
+@define-color theme_unfocused_selected_bg_color {accent};
+@define-color theme_unfocused_selected_fg_color {on_accent};
+@define-color accent_bg_color {accent};
+@define-color accent_fg_color {on_accent};
+@define-color accent_color {accent};
+@define-color blue_3 {accent};
+@define-color window_bg_color {bg};
+@define-color window_fg_color {fg};
+@define-color view_bg_color {bg};
+@define-color view_fg_color {fg};
+@define-color headerbar_bg_color {surface};
+@define-color headerbar_fg_color {fg};
+@define-color headerbar_backdrop_color {surface};
+@define-color headerbar_border_color {border};
+@define-color sidebar_bg_color {surface};
+@define-color sidebar_fg_color {fg};
+@define-color sidebar_backdrop_color {surface};
+@define-color sidebar_border_color {border};
+@define-color secondary_sidebar_bg_color {surface};
+@define-color secondary_sidebar_fg_color {fg};
+@define-color secondary_sidebar_backdrop_color {surface};
+@define-color card_bg_color {surface};
+@define-color card_fg_color {fg};
+@define-color dialog_bg_color {bg};
+@define-color dialog_fg_color {fg};
+
+:root {{
+  --window-bg-color: {bg};
+  --window-fg-color: {fg};
+  --view-bg-color: {bg};
+  --view-fg-color: {fg};
+  --headerbar-bg-color: {surface};
+  --headerbar-fg-color: {fg};
+  --headerbar-backdrop-color: {surface};
+  --headerbar-border-color: {border};
+  --sidebar-bg-color: {surface};
+  --sidebar-fg-color: {fg};
+  --sidebar-backdrop-color: {surface};
+  --sidebar-border-color: {border};
+  --secondary-sidebar-bg-color: {surface};
+  --secondary-sidebar-fg-color: {fg};
+  --secondary-sidebar-backdrop-color: {surface};
+  --card-bg-color: {surface};
+  --card-fg-color: {fg};
+  --dialog-bg-color: {bg};
+  --dialog-fg-color: {fg};
+  --accent-bg-color: {accent};
+  --accent-fg-color: {on_accent};
+  --accent-color: {accent};
+}}
+
+window.messagedialog, window.dialog, window.filechooser,
+.messagedialog, .dialog, .filechooser {{
+  background-color: {bg};
+  color: {fg};
+}}
+window.messagedialog headerbar, window.dialog headerbar, window.filechooser headerbar,
+window.messagedialog .titlebar, window.dialog .titlebar, window.filechooser .titlebar {{
+  background-color: {surface};
+  background-image: none;
+  color: {fg};
+  border-bottom: 1px solid {border};
+}}
+window.messagedialog button.suggested-action,
+window.dialog button.suggested-action,
+window.filechooser button.suggested-action {{
+  background-color: {accent};
+  color: {on_accent};
+}}
+*:selected, *:selected *,
+row:selected, row:selected *,
+listview > row:selected, listview > row:selected *,
+gridview > child:selected, gridview > child:selected *,
+columnview row:selected, columnview row:selected *,
+.view:selected, .view:selected * {{
+  color: {on_accent};
+}}
+{GTK_USER_CSS_END}
+"#
+    )
+}
+
+fn sync_gsettings_color_scheme(is_dark: bool) {
+    let scheme = if is_dark {
+        "prefer-dark"
+    } else {
+        "prefer-light"
+    };
+    let theme = SHELL_GTK_THEME;
+    let icons = papirus_icon_theme(is_dark);
+    let _ = std::process::Command::new("gsettings")
+        .args(["set", "org.gnome.desktop.interface", "color-scheme", scheme])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = std::process::Command::new("gsettings")
+        .args(["set", "org.gnome.desktop.interface", "gtk-theme", theme])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = std::process::Command::new("gsettings")
+        .args(["set", "org.gnome.desktop.interface", "icon-theme", icons])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    // XFCE Power Manager / xfsettingsd (often unset under Hyprland).
+    xfconf_set_string("/Net/ThemeName", theme);
+    xfconf_set_string("/Net/IconThemeName", icons);
+    sync_session_icon_theme(is_dark);
+}
+
+/// Persist theme id, apply chrome CSS, then invoke `on_profile`.
+///
+/// Also notifies [`watch_theme`] listeners so other suite apps (and VTE panels
+/// in this process) stay in sync, and force-resets Hyprland hyprbars + Waybar /
+/// mako / fuzzel / system GTK dialog colors ([`sync_desktop_theme`]).
+pub fn select_theme(id: &str, on_profile: impl FnOnce(&Profile)) {
+    let Some(profile) = profile_by_id(id) else {
+        return;
+    };
+    save_theme_id(id);
+    apply_chrome(profile);
+    on_profile(profile);
+    broadcast_theme(profile, false);
+    sync_desktop_theme(profile);
+}
+
+/// Watch the shared theme file and keep a stateful window action in sync.
+///
+/// Chrome CSS is reapplied by [`watch_theme`]. Use this in apps that only need
+/// the View/Theme menu radio to follow suite-wide profile changes (e.g. calc,
+/// image). Apps with extra surfaces (VTE, SourceView) should call [`watch_theme`]
+/// themselves and update those surfaces in the callback.
+pub fn watch_theme_sync_action(window: &gtk::ApplicationWindow, action_name: &str) {
+    let window = window.clone();
+    let action_name = action_name.to_string();
+    watch_theme(move |profile| {
+        if let Some(action) = window.lookup_action(&action_name) {
+            action
+                .downcast_ref::<gio::SimpleAction>()
+                .map(|a| a.set_state(&profile.id.to_variant()));
+        }
+    });
+}
+
+/// Watch `~/.config/gtk-apps/theme.toml` for profile changes from other apps.
+///
+/// Chrome CSS is reapplied automatically. Register once per process interest
+/// (window / VTE / action state); callbacks run for local [`select_theme`] too.
+pub fn watch_theme(on_change: impl Fn(&Profile) + 'static) {
+    THEME_WATCHERS.with(|state| {
+        let mut state = state.borrow_mut();
+        if state.last_id.is_empty() {
+            state.last_id = load_theme_id();
+        }
+        state.callbacks.push(Rc::new(on_change));
+        if state.monitor.is_some() {
+            return;
+        }
+        // Ensure the file exists so the monitor has a stable target.
+        if !theme_path().exists() {
+            save_theme_id(&load_theme_id());
+        }
+        let file = gio::File::for_path(theme_path());
+        let Ok(monitor) = file.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+        else {
+            return;
+        };
+        monitor.connect_changed(move |_mon, _file, _other, event| {
+            use gio::FileMonitorEvent::*;
+            if !matches!(event, ChangesDoneHint | Changed | Created) {
+                return;
+            }
+            let id = load_theme_id();
+            let should = THEME_WATCHERS.with(|state| state.borrow().last_id != id);
+            if !should {
+                return;
+            }
+            let Some(profile) = profile_by_id(&id) else {
+                return;
+            };
+            apply_chrome(profile);
+            broadcast_theme(profile, true);
+        });
+        state.monitor = Some(monitor);
+    });
+}
+
+/// `from_file_monitor`: skip when id already matches (local [`select_theme`] set it).
+fn broadcast_theme(profile: &Profile, from_file_monitor: bool) {
+    let callbacks = THEME_WATCHERS.with(|state| {
+        let mut state = state.borrow_mut();
+        if from_file_monitor && state.last_id == profile.id {
+            return Vec::new();
+        }
+        state.last_id = profile.id.to_string();
+        state.callbacks.clone()
+    });
+    for cb in callbacks {
+        cb(profile);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// internals
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ThemeFile {
+    profile: String,
+}
+
+fn theme_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("gtk-apps")
+}
+
+fn theme_path() -> PathBuf {
+    theme_dir().join("theme.toml")
+}
+
+fn parse_color(value: &str, fallback: &str) -> gdk::RGBA {
+    value
+        .parse::<gdk::RGBA>()
+        .or_else(|_| fallback.parse::<gdk::RGBA>())
+        .unwrap_or(gdk::RGBA::BLACK)
+}
+
+fn parse_rgb(hex: &str) -> Option<(u8, u8, u8)> {
+    let h = hex.trim().trim_start_matches('#');
+    if h.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&h[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&h[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&h[4..6], 16).ok()?;
+    Some((r, g, b))
+}
+
+fn relative_luminance(hex: &str) -> f32 {
+    let (r, g, b) = parse_rgb(hex).unwrap_or((0, 0, 0));
+    // sRGB relative luminance (approximate, good enough for dark/light splits).
+    (0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)) / 255.0
+}
+
+fn mix_hex(a: &str, b: &str, t: f32) -> String {
+    let (ar, ag, ab) = parse_rgb(a).unwrap_or((0, 0, 0));
+    let (br, bg, bb) = parse_rgb(b).unwrap_or((255, 255, 255));
+    let t = t.clamp(0.0, 1.0);
+    let mix =
+        |x: u8, y: u8| -> u8 { ((f32::from(x) * (1.0 - t)) + (f32::from(y) * t)).round() as u8 };
+    format!("#{:02x}{:02x}{:02x}", mix(ar, br), mix(ag, bg), mix(ab, bb))
+}
+
+thread_local! {
+    static CHROME_PROVIDER: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
+    static THEME_WATCHERS: RefCell<ThemeWatchState> = const { RefCell::new(ThemeWatchState::new()) };
+    static CUSTOM_REGISTRY: RefCell<HashMap<String, (ProfileData, &'static Profile)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Leak owned profile data into a `&'static Profile` so it can be returned
+/// alongside the built-in static profiles. Only reached when a custom profile
+/// is added or changed on disk, so the leak is bounded by user edits.
+fn leak_profile(data: &ProfileData) -> &'static Profile {
+    fn leak_str(s: &str) -> &'static str {
+        Box::leak(s.to_string().into_boxed_str())
+    }
+    let palette = data.normalized_palette();
+    let mut arr: [&'static str; 16] = ["#000000"; 16];
+    for (slot, hex) in arr.iter_mut().zip(palette.iter()) {
+        *slot = leak_str(hex);
+    }
+    let profile = Profile {
+        id: leak_str(&data.id),
+        name: leak_str(&data.name),
+        foreground: leak_str(&data.foreground),
+        background: leak_str(&data.background),
+        palette: arr,
+    };
+    Box::leak(Box::new(profile))
+}
+
+/// Sync the in-process custom-profile registry with the on-disk store,
+/// re-leaking only entries whose data changed and dropping deleted ones.
+fn refresh_custom_registry() {
+    let list = load_custom_profiles();
+    CUSTOM_REGISTRY.with(|reg| {
+        let mut reg = reg.borrow_mut();
+        let live: std::collections::HashSet<String> = list.iter().map(|d| d.id.clone()).collect();
+        reg.retain(|id, _| live.contains(id));
+        for data in list {
+            let unchanged = reg
+                .get(&data.id)
+                .map(|(existing, _)| existing == &data)
+                .unwrap_or(false);
+            if !unchanged {
+                let leaked = leak_profile(&data);
+                reg.insert(data.id.clone(), (data, leaked));
+            }
+        }
+    });
+}
+
+struct ThemeWatchState {
+    monitor: Option<gio::FileMonitor>,
+    last_id: String,
+    callbacks: Vec<Rc<dyn Fn(&Profile)>>,
+}
+
+impl ThemeWatchState {
+    const fn new() -> Self {
+        Self {
+            monitor: None,
+            last_id: String::new(),
+            callbacks: Vec::new(),
+        }
+    }
+}
+
+/// Fallback when `profiles.json` is missing or empty at compile time.
+const NEURONIX_FALLBACK: Profile = Profile {
+    id: "neuronix",
+    name: "Neuronix",
+    foreground: "#eeffff",
+    background: "#212121",
+    palette: [
+        "#000000", "#ff5370", "#c3e88d", "#ffcb6b", "#d75d1b", "#c792ea", "#89ddff", "#ffffff",
+        "#000000", "#ff5370", "#c3e88d", "#ffcb6b", "#82aaff", "#c792ea", "#89ddff", "#ffffff",
+    ],
+};
