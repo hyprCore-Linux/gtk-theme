@@ -560,7 +560,7 @@ pub fn builtin_profiles() -> &'static [Profile] {
         let mut profiles: Vec<Profile> = parsed.iter().map(|d| *leak_profile(d)).collect();
         if profiles.is_empty() {
             profiles.push(STOCK_PROFILE);
-        } else if let Some(idx) = profiles.iter().position(|p| p.id == "neuronix") {
+        } else if let Some(idx) = profiles.iter().position(|p| p.id == "hyprcore") {
             if idx != 0 {
                 profiles.swap(0, idx);
             }
@@ -598,7 +598,7 @@ pub fn profile_by_id(id: &str) -> Option<&'static Profile> {
 }
 
 pub fn default_profile_id() -> &'static str {
-    "neuronix"
+    "hyprcore"
 }
 
 pub fn default_profile() -> &'static Profile {
@@ -1748,24 +1748,24 @@ pub fn choice_dialog_css() -> String {
     let hover = mix_hex(bg, fg, 0.26);
     format!(
         r#"
-window.neuronix-choice {{
+window.hyprcore-choice {{
   background-color: {bg};
   color: {fg};
   border-radius: 12px;
 }}
-box.neuronix-root {{
+box.hyprcore-root {{
   background-color: {bg};
 }}
-label.neuronix-title {{
+label.hyprcore-title {{
   color: {fg};
   font-size: 22px;
   font-weight: 700;
 }}
-label.neuronix-subtitle {{
+label.hyprcore-subtitle {{
   color: {muted};
   font-size: 13px;
 }}
-button.neuronix-card {{
+button.hyprcore-card {{
   background-color: {tile};
   background-image: none;
   border: 1px solid {surface};
@@ -1776,20 +1776,20 @@ button.neuronix-card {{
   margin: 0;
   min-height: 56px;
 }}
-button.neuronix-card:hover {{
+button.hyprcore-card:hover {{
   background-color: {hover};
   border-color: {accent};
 }}
-button.neuronix-card label.neuronix-row-title {{
+button.hyprcore-card label.hyprcore-row-title {{
   color: {fg};
   font-size: 15px;
   font-weight: 600;
 }}
-button.neuronix-card label.neuronix-row-desc {{
+button.hyprcore-card label.hyprcore-row-desc {{
   color: {muted};
   font-size: 12px;
 }}
-button.neuronix-close {{
+button.hyprcore-close {{
   background-color: {tile};
   background-image: none;
   color: {fg};
@@ -1799,7 +1799,7 @@ button.neuronix-close {{
   font-size: 13px;
   min-width: 88px;
 }}
-button.neuronix-close:hover {{
+button.hyprcore-close:hover {{
   background-color: {hover};
   border-color: {accent};
 }}
@@ -2031,7 +2031,7 @@ pub fn sourceview_scheme_candidates(profile_id: &str) -> &'static [&'static str]
         "ayu-dark" | "ayu-mirage" => &["ayu-dark", "Adwaita-dark", "classic"],
         "night-owl" => &["night-owl", "Adwaita-dark", "classic"],
         "palenight" => &["palenight", "Adwaita-dark", "classic"],
-        "material-darker" | "neuronix" => &["material-darker", "Adwaita-dark", "classic"],
+        "material-darker" | "hyprcore" => &["material-darker", "Adwaita-dark", "classic"],
         "cobalt2" => &["cobalt", "Adwaita-dark", "classic"],
         "zenburn" => &["zenburn", "oblivion", "Adwaita-dark", "classic"],
         "tomorrow-night" => &["tomorrow-night", "Adwaita-dark", "classic"],
@@ -2477,7 +2477,7 @@ fn ensure_symbols_nerd_font() {
     let srcs = [
         PathBuf::from("/usr/local/share/fonts/truetype/nerd-fonts/SymbolsNerdFont-Regular.ttf"),
         PathBuf::from("/usr/share/fonts/truetype/nerd-fonts/SymbolsNerdFont-Regular.ttf"),
-        PathBuf::from("/usr/share/neuronix/fonts/SymbolsNerdFont-Regular.ttf"),
+        PathBuf::from("/usr/share/hyprcore/fonts/SymbolsNerdFont-Regular.ttf"),
     ];
     let Some(src) = srcs.into_iter().find(|p| p.is_file()) else {
         return;
@@ -2756,7 +2756,7 @@ fn hyprctl_reload() {
 }
 
 fn theme_session_safe() -> bool {
-    std::env::var_os("NEURONIX_THEME_NO_HYPR_RELOAD").is_some()
+    std::env::var_os("HYPRCORE_THEME_NO_HYPR_RELOAD").is_some()
 }
 
 /// True when the Hyprland hyprbars plugin is loaded (titlebar − □ ×).
@@ -2791,7 +2791,7 @@ pub fn prepare_headerbar(header: &gtk::HeaderBar) {
 /// Best-effort: restyle Waybar / mako / fuzzel / Hyprland window borders to the
 /// active profile (bg / fg / surface_alt border), then reload those clients.
 /// Also writes user GTK3/GTK4 CSS so zenity (Choose background) matches,
-/// and regenerates `~/.themes/neuronix` (GTK4 pavucontrol and other system apps).
+/// and regenerates `~/.themes/hyprcore` (GTK4 pavucontrol and other system apps).
 ///
 /// Always rewrites known config paths (both `~/.config` and `~/configs`) and
 /// hard-restarts Waybar so a profile switch cannot leave a stale bar on screen.
@@ -3434,7 +3434,7 @@ const GTK_USER_CSS_END: &str = "/* END gtk-theme:shell-chrome */";
 const WAYBAR_VARS_BEGIN: &str = "/* BEGIN gtk-theme:waybar-vars */";
 const WAYBAR_VARS_END: &str = "/* END gtk-theme:waybar-vars */";
 /// Full GTK3/GTK4 theme under ~/.themes (THEME priority). Rewritten on profile change.
-const SHELL_GTK_THEME: &str = "neuronix";
+const SHELL_GTK_THEME: &str = "hyprcore";
 
 fn papirus_icon_theme(is_dark: bool) -> &'static str {
     // Papirus action glyphs are dark (#444); Papirus-Dark is light-on-dark.
@@ -4136,7 +4136,7 @@ fn sync_gtk_user_css(profile: &Profile) {
     // rules here load at STYLE_PROVIDER_PRIORITY_USER and permanently override
     // suite chrome (USER-10) until the process restarts — that left purple
     // headerbars after switching to a light profile.
-    // Full GTK4 chrome for pavucontrol etc. lives in ~/.themes/neuronix.
+    // Full GTK4 chrome for pavucontrol etc. lives in ~/.themes/hyprcore.
     let gtk3 = system_dialog_css(profile);
     let gtk4 = system_dialog_css_gtk4(profile);
     for (ver, block) in [("gtk-3.0", gtk3.as_str()), ("gtk-4.0", gtk4.as_str())] {
@@ -4515,12 +4515,12 @@ impl ThemeWatchState {
 
 /// Fallback when `profiles.json` is missing or empty at compile time.
 const STOCK_PROFILE: Profile = Profile {
-    id: "neuronix",
+    id: "hyprCore",
     name: "hyprCore Linux",
     foreground: "#eeffff",
     background: "#212121",
     palette: [
-        "#000000", "#ff5370", "#c3e88d", "#ffcb6b", "#d75d1b", "#c792ea", "#89ddff", "#ffffff",
+        "#000000", "#ff5370", "#c3e88d", "#ffcb6b", "#d32f2f", "#c792ea", "#89ddff", "#ffffff",
         "#000000", "#ff5370", "#c3e88d", "#ffcb6b", "#82aaff", "#c792ea", "#89ddff", "#ffffff",
     ],
 };
