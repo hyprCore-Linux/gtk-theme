@@ -1178,16 +1178,20 @@ gridview.file-grid {{
 }}
 columnview.file-list > header,
 columnview.file-list header {{
-  background-color: {surface};
+  background-color: {bg};
   background-image: none;
   color: {fg};
-  border-bottom: 1px solid {border};
+  border: none;
+  box-shadow: none;
 }}
 columnview.file-list header button,
 columnview.file-list header label {{
-  color: {fg};
+  color: alpha({fg}, 0.7);
   background-color: transparent;
   background-image: none;
+  border: none;
+  box-shadow: none;
+  outline: none;
 }}
 .file-list row:hover,
 .file-grid child:hover,
@@ -1248,39 +1252,93 @@ listbox row label,
 listview row label {{
   color: inherit;
 }}
-notebook {{
+notebook,
+notebook.frame {{
   background-color: {bg};
   background-image: none;
   color: {fg};
+  /* GTK4 Notebook ships `.frame` → 1px outline; kill it. */
+  border: none;
+  outline: none;
+  box-shadow: none;
 }}
 notebook > header {{
+  /* Gray strip — not window/editor {bg}, so tabs stay visible. */
   background: {surface};
   background-color: {surface};
   background-image: none;
-  border-color: {border};
+  border: none;
+  border-color: transparent;
+  box-shadow: none;
+  padding: 0;
 }}
-notebook > header > tabs > tab {{
+notebook > header > tabs {{
+  background: transparent;
   background-color: transparent;
+  border: none;
+  box-shadow: none;
+}}
+notebook > header > tabs > tab,
+notebook > header.top > tabs > tab,
+notebook > header.bottom > tabs > tab,
+notebook > header.left > tabs > tab,
+notebook > header.right > tabs > tab {{
+  background-color: {surface};
+  background-image: none;
+  color: alpha({fg}, 0.65);
+  border: none;
+  border-width: 0;
+  border-color: transparent;
+  border-radius: 0;
+  box-shadow: none;
+  outline: none;
+  min-height: 2.25em;
+  padding: 6px 12px;
+  margin: 0;
+}}
+notebook > header > tabs > tab:hover,
+notebook > header.top > tabs > tab:hover {{
+  background-color: {hover};
   background-image: none;
   color: {fg};
+  box-shadow: none;
+  border: none;
 }}
-notebook > header > tabs > tab:checked {{
+notebook > header > tabs > tab:checked,
+notebook > header > tabs > tab:checked:hover,
+notebook > header > tabs > tab:checked:backdrop,
+notebook > header.top > tabs > tab:checked,
+notebook > header.top > tabs > tab:checked:hover,
+notebook > header.top > tabs > tab:checked:backdrop,
+notebook > header.bottom > tabs > tab:checked,
+notebook > header.left > tabs > tab:checked,
+notebook > header.right > tabs > tab:checked {{
+  /* Active = darker gray vs inactive surface — no accent underline. */
   background-color: {surface_alt};
   background-image: none;
   color: {fg};
+  font-weight: 600;
+  border: none;
+  border-width: 0;
+  border-color: transparent;
+  box-shadow: none;
+  outline: none;
 }}
-/* gtk-edit: document tabs expand equally; trailing "+" stays compact. */
-notebook.gtk-edit-tabs > header > tabs > tab {{
+notebook > header > tabs > tab:checked:hover,
+notebook > header.top > tabs > tab:checked:hover {{
+  background-color: {surface_alt};
+  box-shadow: none;
+}}
+/* gtk-edit / gtk-files: document/folder tabs expand equally across the bar. */
+notebook.gtk-edit-tabs > header > tabs > tab,
+notebook.gtk-files-tabs > header > tabs > tab {{
   min-width: 0;
 }}
-notebook.gtk-edit-tabs > header > tabs > tab:has(.gtk-edit-new-tab) {{
-  padding: 0;
-  min-width: 2.25em;
-  max-width: 2.25em;
-}}
+/* Class on the tab label box — avoid :has() (GTK CSS rejects it). */
 .gtk-edit-new-tab {{
   min-width: 2.25em;
   max-width: 2.25em;
+  padding: 0;
 }}
 button.gtk-edit-new-tab-label {{
   min-width: 2.25em;
@@ -1293,6 +1351,8 @@ button.gtk-edit-new-tab-label {{
 notebook > stack {{
   background-color: {bg};
   background-image: none;
+  border: none;
+  box-shadow: none;
 }}
 
 /* ---- popovers / menus / dialogs ----
@@ -1675,29 +1735,35 @@ headerbar .pathbar > *,
 }}
 
 /* ---- panes / separators / status ----
- * Adwaita-dark paned separators use background-image: image(#1b1b1b) and
- * .wide fills with #353535 — override both layers.
+ * Match window bg so paned splits are not a bright 1px “white” line.
+ * Keep a usable drag hit-target without a visible stripe.
  */
 separator {{
-  background-color: {border};
+  background-color: {bg};
   background-image: none;
+  border: none;
+  min-width: 1px;
+  min-height: 1px;
 }}
 paned > separator,
 paned > separator.wide,
 paned > separator:hover,
 paned > separator.wide:hover {{
-  background: {border};
-  background-color: {border};
+  background: {bg};
+  background-color: {bg};
   background-image: none;
-  min-width: 4px;
-  min-height: 4px;
+  border: none;
+  box-shadow: none;
+  min-width: 6px;
+  min-height: 6px;
 }}
 statusbar, .statusbar {{
   background: {surface};
   background-color: {surface};
   background-image: none;
   color: {fg};
-  border-top: 1px solid {border};
+  border-top: none;
+  box-shadow: none;
 }}
 
 /* ---- gtk-files terminal sidebar (right) ---- */
@@ -1705,7 +1771,7 @@ statusbar, .statusbar {{
   background-color: {bg};
   background-image: none;
   color: {fg};
-  border-left: 1px solid {border};
+  border-left: none;
 }}
 .terminal-panel-header {{
   background-color: {surface};
@@ -1974,8 +2040,8 @@ fn apply_chrome_css(is_dark: bool, css: &str) {
                 gtk::style_context_add_provider_for_display(
                     &display,
                     &provider,
-                    // Above app CSS; just under USER so ~/.config/*/style.css still wins.
-                    gtk::STYLE_PROVIDER_PRIORITY_USER.saturating_sub(10),
+                    // USER: must beat ~/.themes/*/gtk-4.0 (THEME) notebook accent bars.
+                    gtk::STYLE_PROVIDER_PRIORITY_USER,
                 );
                 provider
             });
@@ -3451,7 +3517,8 @@ fn system_dialog_css(profile: &Profile) -> String {
     let bg = profile.background;
     let fg = profile.foreground;
     let surface = profile.surface_hex();
-    let border = profile.surface_alt_hex();
+    let surface_alt = profile.surface_alt_hex();
+    let border = surface_alt.clone();
     let accent = profile.accent();
     let on_accent = if relative_luminance(accent) < 0.55 {
         "#fbf1c7"
@@ -3549,29 +3616,51 @@ scrolledwindow, viewport, .view, textview, textview text {{
   background-image: none;
   color: {fg};
 }}
+notebook, frame, frame > border {{
+  border: none;
+  outline: none;
+  box-shadow: none;
+}}
 notebook > header {{
   background-color: {surface};
   background-image: none;
-  border-color: {border};
+  border: none;
+  border-color: transparent;
+  box-shadow: none;
 }}
 notebook > header > tabs > tab {{
   background-color: {surface};
   background-image: none;
-  color: {fg};
-  border-color: {border};
+  color: alpha({fg}, 0.65);
+  border: none;
+  border-color: transparent;
+  border-radius: 0;
   box-shadow: none;
+  outline: none;
 }}
 notebook > header > tabs > tab:hover {{
   background-color: {hover};
+  color: {fg};
+  box-shadow: none;
 }}
 notebook > header > tabs > tab:checked {{
-  background-color: {bg};
+  /* Active tab: darker gray strip, never accent underline. */
+  background-color: {surface_alt};
   color: {fg};
-  box-shadow: inset 0 -2px {accent};
+  font-weight: 600;
+  border: none;
+  box-shadow: none;
+  outline: none;
+}}
+notebook > header > tabs > tab:checked:hover {{
+  background-color: {surface_alt};
+  box-shadow: none;
 }}
 notebook > stack {{
   background-color: {bg};
   color: {fg};
+  border: none;
+  box-shadow: none;
 }}
 treeview, treeview.view, list, list row {{
   background-color: {bg};
@@ -3699,17 +3788,39 @@ switch:backdrop:checked, switch:checked:not(:disabled) {{
 switch:checked > slider, switch:backdrop:checked > slider {{
   border-color: {accent};
 }}
-notebook > header.top > tabs > tab:checked {{
-  box-shadow: inset 0 -4px {accent};
-}}
-notebook > header.bottom > tabs > tab:checked {{
-  box-shadow: inset 0 4px {accent};
-}}
-notebook > header.left > tabs > tab:checked {{
-  box-shadow: inset -4px 0 {accent};
-}}
+/* Kill Adwaita's thick accent underline on notebook tabs (all states). */
+notebook > header > tabs > tab,
+notebook > header > tabs > tab:hover,
+notebook > header > tabs > tab:checked,
+notebook > header > tabs > tab:checked:hover,
+notebook > header > tabs > tab:checked:active,
+notebook > header > tabs > tab:checked:backdrop,
+notebook > header.top > tabs > tab,
+notebook > header.top > tabs > tab:hover,
+notebook > header.top > tabs > tab:checked,
+notebook > header.top > tabs > tab:checked:hover,
+notebook > header.top > tabs > tab:checked:active,
+notebook > header.top > tabs > tab:checked:backdrop,
+notebook > header.bottom > tabs > tab:checked,
+notebook > header.bottom > tabs > tab:checked:hover,
+notebook > header.left > tabs > tab:checked,
 notebook > header.right > tabs > tab:checked {{
-  box-shadow: inset 4px 0 {accent};
+  box-shadow: none !important;
+  border: none !important;
+  border-width: 0 !important;
+  border-bottom: none !important;
+  border-image: none !important;
+  outline: none !important;
+  background-image: none !important;
+}}
+notebook,
+notebook > header,
+notebook > stack,
+paned > separator,
+paned > separator.wide {{
+  border: none !important;
+  box-shadow: none !important;
+  outline: none !important;
 }}
 progressbar progress, scale highlight,
 progressbar progress:backdrop, scale highlight:backdrop {{
@@ -4438,7 +4549,8 @@ fn relative_luminance(hex: &str) -> f32 {
     (0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)) / 255.0
 }
 
-fn mix_hex(a: &str, b: &str, t: f32) -> String {
+/// Mix two `#rrggbb` colors by `t` (0 = all `a`, 1 = all `b`).
+pub fn mix_hex(a: &str, b: &str, t: f32) -> String {
     let (ar, ag, ab) = parse_rgb(a).unwrap_or((0, 0, 0));
     let (br, bg, bb) = parse_rgb(b).unwrap_or((255, 255, 255));
     let t = t.clamp(0.0, 1.0);
