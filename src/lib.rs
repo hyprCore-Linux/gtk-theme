@@ -280,17 +280,6 @@ impl ChromeButtons {
         self.maximize = max.to_string();
         self.close = close.to_string();
     }
-
-    fn glyph_for_action(&self, action: &str) -> &str {
-        let lower = action.to_ascii_lowercase();
-        if lower.contains("killactive") || lower.contains("closewindow") {
-            &self.close
-        } else if lower.contains("fullscreen") {
-            &self.maximize
-        } else {
-            &self.minimize
-        }
-    }
 }
 
 /// Window outline geometry + titlebar buttons stored on a suite profile.
@@ -873,6 +862,72 @@ headerbar {{
 }}
 menubar, popovermenubar, .menubar {{
   border-bottom: 1px solid {border};
+}}
+/* Reveal menubar: no underline. Vertical-homogeneous stack stops header jump. */
+.gtk-reveal-controls {{
+  margin-start: 4px;
+  min-height: 34px;
+}}
+popovermenubar.gtk-reveal-menubar,
+.gtk-reveal-menubar {{
+  border: none;
+  border-bottom: none;
+  border-top: none;
+  box-shadow: none;
+  background: transparent;
+  background-color: transparent;
+  background-image: none;
+  padding: 0;
+  margin: 0;
+  min-height: 34px;
+}}
+.gtk-reveal-menubar > *,
+.gtk-reveal-menubar menubutton,
+.gtk-reveal-menubar button,
+popovermenubar.gtk-reveal-menubar > menubutton,
+popovermenubar.gtk-reveal-menubar > button {{
+  border: none;
+  border-bottom: none;
+  border-top: none;
+  border-radius: 4px;
+  box-shadow: none;
+  outline: none;
+  background-image: none;
+  min-height: 28px;
+  padding-top: 4px;
+  padding-bottom: 4px;
+}}
+.gtk-reveal-menubar menubutton:hover,
+.gtk-reveal-menubar menubutton:checked,
+.gtk-reveal-menubar menubutton:active,
+.gtk-reveal-menubar button:hover,
+.gtk-reveal-menubar button:checked,
+.gtk-reveal-menubar button:active,
+popovermenubar.gtk-reveal-menubar > menubutton:hover,
+popovermenubar.gtk-reveal-menubar > menubutton:checked,
+popovermenubar.gtk-reveal-menubar > menubutton:active {{
+  border: none;
+  border-bottom: none;
+  box-shadow: none;
+  outline: none;
+  background-image: none;
+  background-color: {hover};
+  color: {fg};
+}}
+/* CSS-drawn ellipsis ··· — no font / tofu dependency. */
+button.gtk-reveal-menu-btn {{
+  min-width: 28px;
+  min-height: 34px;
+  padding: 4px 6px;
+}}
+.gtk-reveal-menu-glyph {{
+  min-width: 16px;
+}}
+.gtk-reveal-menu-dot {{
+  min-width: 4px;
+  min-height: 4px;
+  background-color: {fg};
+  border-radius: 100%;
 }}
 /* gtk-meld path bars — Adwaita ActionBar picks up accent tint (purple). */
 actionbar > revealer > box,
@@ -1511,6 +1566,19 @@ window.gtk-dialog button {{
   color: {fg};
   border: 1px solid {border};
 }}
+/* Compact action row — never stretch OK/Cancel across the dialog width. */
+window.gtk-dialog box.dialog-action-area {{
+  padding: 0;
+}}
+window.gtk-dialog box.dialog-action-area button {{
+  min-width: 72px;
+  min-height: 28px;
+  padding: 4px 16px;
+  border-radius: 6px;
+}}
+window.gtk-dialog box.dialog-content label.dialog-detail {{
+  opacity: 0.85;
+}}
 dialog button label,
 messagedialog button label,
 window.gtk-dialog button label {{
@@ -1799,6 +1867,173 @@ pub fn style_dialog(window: &impl IsA<gtk::Widget>) {
     window.add_css_class("gtk-dialog");
 }
 
+/// Simple OK alert — compact button bottom-right (not Adwaita’s full-bleed bar).
+pub fn present_message(
+    parent: Option<&impl IsA<gtk::Window>>,
+    title: &str,
+    detail: &str,
+) {
+    present_buttons(parent, title, detail, &["OK"], 0, Some(0), |_| {});
+}
+
+/// Cancel / confirm chooser. `cb(true)` when the confirm button (index 1) is chosen.
+pub fn present_confirm(
+    parent: Option<&impl IsA<gtk::Window>>,
+    title: &str,
+    detail: &str,
+    confirm_label: &str,
+    cb: impl FnOnce(bool) + 'static,
+) {
+    present_buttons(
+        parent,
+        title,
+        detail,
+        &["Cancel", confirm_label],
+        1,
+        Some(0),
+        move |idx| cb(idx == 1),
+    );
+}
+
+/// Themed alert with one or more actions aligned to the bottom-right.
+///
+/// `default_idx` is activated on Enter; `cancel_idx` on Escape / window close
+/// (`cb` receives that index, or `-1` if no cancel was set). Prefer this over
+/// [`gtk::AlertDialog`], which paints a full-width footer button.
+pub fn present_buttons(
+    parent: Option<&impl IsA<gtk::Window>>,
+    title: &str,
+    detail: &str,
+    buttons: &[&str],
+    default_idx: i32,
+    cancel_idx: Option<i32>,
+    cb: impl FnOnce(i32) + 'static,
+) {
+    let win = gtk::Window::builder()
+        .modal(true)
+        .resizable(false)
+        .default_width(420)
+        .title("")
+        .build();
+    style_dialog(&win);
+    if let Some(p) = parent {
+        win.set_transient_for(Some(p));
+        win.set_destroy_with_parent(true);
+    }
+
+    let header = gtk::HeaderBar::new();
+    prepare_headerbar(&header);
+    // Empty title widget so HeaderBar does not mirror a window title.
+    header.set_title_widget(Some(&gtk::Label::new(None)));
+    win.set_titlebar(Some(&header));
+
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    page.add_css_class("dialog-content");
+    page.set_margin_start(20);
+    page.set_margin_end(20);
+    page.set_margin_top(16);
+    page.set_margin_bottom(8);
+
+    let title_label = gtk::Label::new(Some(title));
+    title_label.add_css_class("title-2");
+    title_label.set_wrap(true);
+    title_label.set_xalign(0.0);
+    title_label.set_selectable(true);
+    page.append(&title_label);
+
+    if !detail.trim().is_empty() {
+        let detail_label = gtk::Label::new(Some(detail));
+        detail_label.add_css_class("dialog-detail");
+        detail_label.set_wrap(true);
+        detail_label.set_xalign(0.0);
+        detail_label.set_selectable(true);
+        detail_label.set_max_width_chars(56);
+        page.append(&detail_label);
+    }
+
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.add_css_class("dialog-action-area");
+    actions.set_halign(gtk::Align::End);
+    actions.set_hexpand(true);
+    actions.set_margin_start(16);
+    actions.set_margin_end(16);
+    actions.set_margin_top(4);
+    actions.set_margin_bottom(14);
+
+    let finished = Rc::new(Cell::new(false));
+    let cb = Rc::new(RefCell::new(Some(cb)));
+    let finish = {
+        let win = win.clone();
+        let finished = Rc::clone(&finished);
+        let cb = Rc::clone(&cb);
+        Rc::new(move |idx: i32| {
+            if finished.replace(true) {
+                return;
+            }
+            if let Some(cb) = cb.borrow_mut().take() {
+                cb(idx);
+            }
+            win.close();
+        }) as Rc<dyn Fn(i32)>
+    };
+
+    let mut default_btn: Option<gtk::Button> = None;
+    for (i, label) in buttons.iter().enumerate() {
+        let btn = labeled_button(icon_for_label(label), label);
+        btn.set_hexpand(false);
+        btn.set_halign(gtk::Align::End);
+        if i as i32 == default_idx {
+            btn.add_css_class("suggested-action");
+            default_btn = Some(btn.clone());
+        }
+        let finish = Rc::clone(&finish);
+        let idx = i as i32;
+        btn.connect_clicked(move |_| finish(idx));
+        actions.append(&btn);
+    }
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.append(&page);
+    root.append(&actions);
+    win.set_child(Some(&root));
+
+    if let Some(btn) = default_btn {
+        win.set_default_widget(Some(&btn));
+    }
+
+    {
+        let finish = Rc::clone(&finish);
+        let cancel_idx = cancel_idx.unwrap_or(-1);
+        let key = gtk::EventControllerKey::new();
+        key.set_propagation_phase(gtk::PropagationPhase::Capture);
+        key.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                finish(cancel_idx);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        win.add_controller(key);
+    }
+
+    {
+        // Titlebar close / WM dismiss — run cancel once; do not re-enter via finish→close.
+        let finished = Rc::clone(&finished);
+        let cb = Rc::clone(&cb);
+        let cancel_idx = cancel_idx.unwrap_or(-1);
+        win.connect_close_request(move |_| {
+            if !finished.replace(true) {
+                if let Some(cb) = cb.borrow_mut().take() {
+                    cb(cancel_idx);
+                }
+            }
+            glib::Propagation::Proceed
+        });
+    }
+
+    win.present();
+}
+
 /// CSS for card-choice dialogs (Setup Sync, Settings hub).
 ///
 /// Hard-coded `#2e2e2e` greys ignore the suite profile; this uses the same
@@ -2011,25 +2246,14 @@ fn apply_chrome_css(is_dark: bool, css: &str) {
     // Align GTK's light/dark preference with the suite profile so Adwaita does
     // not keep loading Default-dark assets under a light profile. Apps still
     // rely on chrome CSS overrides when the desktop theme is forced to *-dark.
-    let hide_csd_controls = hyprbars_active();
     if let Some(settings) = gtk::Settings::default() {
         settings.set_gtk_application_prefer_dark_theme(is_dark);
-        // Hyprbars draws − □ ×; hide GTK CSD window controls to avoid doubles.
-        if hide_csd_controls {
-            settings.set_gtk_decoration_layout(Some(":"));
-        }
+        // Keep an in-header close (X) even under hyprbars — suite apps rely on it.
+        settings.set_gtk_decoration_layout(Some(":close"));
     }
 
     // Adwaita symbolics for menus/toolbars even when the session uses Faenza/etc.
     ensure_adwaita_icons();
-
-    let css_owned;
-    let css = if hide_csd_controls {
-        css_owned = format!("{css}\n{HIDE_CSD_WINDOWCONTROLS_CSS}");
-        css_owned.as_str()
-    } else {
-        css
-    };
 
     if let Some(display) = gdk::Display::default() {
         CHROME_PROVIDER.with(|slot| {
@@ -2049,32 +2273,6 @@ fn apply_chrome_css(is_dark: bool, css: &str) {
         });
     }
 }
-
-/// Collapse / hide GTK client-side window controls (close etc.) when hyprbars
-/// already provides them.
-const HIDE_CSD_WINDOWCONTROLS_CSS: &str = r#"
-headerbar windowcontrols,
-.titlebar windowcontrols,
-windowcontrols {
-  opacity: 0;
-  min-width: 0;
-  padding: 0;
-  margin: 0;
-}
-headerbar windowcontrols button,
-.titlebar windowcontrols button,
-windowcontrols button {
-  min-width: 0;
-  min-height: 0;
-  padding: 0;
-  margin: 0;
-  opacity: 0;
-  border: none;
-  background: none;
-  background-image: none;
-  box-shadow: none;
-}
-"#;
 
 /// Preferred GtkSourceView scheme ids for a profile (first available wins).
 pub fn sourceview_scheme_candidates(profile_id: &str) -> &'static [&'static str] {
@@ -2295,8 +2493,7 @@ pub fn profile_id_at(ids: &[&'static str], selected: u32) -> Option<&'static str
 /// push live via `hyprctl keyword`. No-op outside Hyprland.
 /// Does not `hyprctl reload` — that re-runs monitor= and rearranges displays.
 pub fn sync_hyprbars(profile: &Profile) {
-    let chrome = profile.window_chrome();
-    let _ = sync_hyprbars_chrome(&profile.surface_hex(), profile.foreground, &chrome);
+    // Hyprbars is not used. The name remains so existing callers still refresh tabs.
     let _ = sync_hyprtabs(profile);
 }
 
@@ -2445,77 +2642,9 @@ fn rewrite_hyprtabs_assigns(text: &str, assigns: &[(&str, &str)]) -> String {
     out
 }
 
-/// Same as [`sync_hyprbars`] for arbitrary hex colors (`#rrggbb`).
+/// Hyprbars is not used. Kept so older callers still compile.
 pub fn sync_hyprbars_colors(bar_hex: &str, text_hex: &str) -> bool {
-    sync_hyprbars_chrome(bar_hex, text_hex, &WindowChrome::default())
-}
-
-fn sync_hyprbars_chrome(bar_hex: &str, text_hex: &str, chrome: &WindowChrome) -> bool {
-    let [bar0, bar1] = chrome.bar_stops(bar_hex, text_hex);
-    let [ibar0, ibar1] = chrome.bar_inactive_stops(bar_hex, bar_hex);
-    let Some(bar_rgb) = hex_to_hypr_rgb(&bar0) else {
-        return false;
-    };
-    let Some(bar2_rgb) = hex_to_hypr_rgb(&bar1) else {
-        return false;
-    };
-    let Some(ibar_rgb) = hex_to_hypr_rgb(&ibar0) else {
-        return false;
-    };
-    let Some(ibar2_rgb) = hex_to_hypr_rgb(&ibar1) else {
-        return false;
-    };
-    let Some(text_rgb) = hex_to_hypr_rgb(text_hex) else {
-        return false;
-    };
-    let bar_rgba = format!("rgba({}ff)", &bar_rgb[4..10]);
-    let bar2_rgba = format!("rgba({}ff)", &bar2_rgb[4..10]);
-    let ibar_rgba = format!("rgba({}ff)", &ibar_rgb[4..10]);
-    let ibar2_rgba = format!("rgba({}ff)", &ibar2_rgb[4..10]);
-    let dir = chrome.gradient.as_id();
-    let btn_size = chrome.buttons.size.to_string();
-    let font = chrome_bar_font(chrome);
-    if chrome.buttons.kit == "nerd" {
-        ensure_symbols_nerd_font();
-    }
-
-    // 1) Persist so the next login / reload keeps the colors.
-    if let Some(path) = hyprland_conf_path() {
-        if let Ok(original) = std::fs::read_to_string(&path) {
-            let mut out = original.clone();
-            out = replace_hypr_assign(&out, "bar_color", &bar_rgba);
-            out = replace_or_insert_hypr_assign(&out, "bar_color2", &bar2_rgba, "bar_color");
-            out =
-                replace_or_insert_hypr_assign(&out, "bar_color_inactive", &ibar_rgba, "bar_color2");
-            out = replace_or_insert_hypr_assign(
-                &out,
-                "bar_color_inactive2",
-                &ibar2_rgba,
-                "bar_color_inactive",
-            );
-            out = replace_or_insert_hypr_assign(&out, "bar_gradient", dir, "bar_color_inactive2");
-            out = replace_hypr_assign(&out, "col.text", &text_rgb);
-            out = replace_hypr_assign(&out, "inactive_button_color", &ibar_rgb);
-            out = replace_hypr_assign(&out, "bar_text_font", font);
-            out = rewrite_hyprbars_buttons(&out, &bar_rgb, &text_rgb, &btn_size, &chrome.buttons);
-            if out != original {
-                let _ = std::fs::write(&path, out);
-            }
-        }
-    }
-
-    // 2) Live update (no full compositor restart). hyprCore Linux hyprbars replaces
-    //    hyprbars-button rows that share the same action, so keywords are safe.
-    //    Title-bar gradient uses a dispatcher because new plugin: keys are not
-    //    keyword-addressable until a config reload (which we must not do).
-    if !theme_session_safe() {
-        hyprctl_keyword("plugin:hyprbars:bar_color", &bar_rgba);
-        hyprctl_keyword("plugin:hyprbars:col.text", &text_rgb);
-        hyprctl_keyword("plugin:hyprbars:inactive_button_color", &ibar_rgb);
-        hyprctl_keyword("plugin:hyprbars:bar_text_font", font);
-        apply_hyprbars_fill(&bar_rgba, &bar2_rgba, &ibar_rgba, &ibar2_rgba, dir);
-        apply_hyprbars_button_keywords(&bar_rgb, &text_rgb, chrome);
-    }
+    let _ = (bar_hex, text_hex);
     true
 }
 
@@ -2524,76 +2653,6 @@ fn chrome_bar_font(chrome: &WindowChrome) -> &'static str {
         "Symbols Nerd Font"
     } else {
         "DejaVu Sans"
-    }
-}
-
-fn ensure_symbols_nerd_font() {
-    let dests: Vec<PathBuf> = [
-        dirs::data_local_dir().map(|d| d.join("fonts/SymbolsNerdFont-Regular.ttf")),
-        Some(PathBuf::from(
-            "/usr/local/share/fonts/truetype/nerd-fonts/SymbolsNerdFont-Regular.ttf",
-        )),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    if dests.iter().any(|p| p.is_file()) {
-        return;
-    }
-    let srcs = [
-        PathBuf::from("/usr/local/share/fonts/truetype/nerd-fonts/SymbolsNerdFont-Regular.ttf"),
-        PathBuf::from("/usr/share/fonts/truetype/nerd-fonts/SymbolsNerdFont-Regular.ttf"),
-        PathBuf::from("/usr/share/hyprcore/fonts/SymbolsNerdFont-Regular.ttf"),
-    ];
-    let Some(src) = srcs.into_iter().find(|p| p.is_file()) else {
-        return;
-    };
-    if let Some(dest) = dirs::data_local_dir().map(|d| d.join("fonts/SymbolsNerdFont-Regular.ttf"))
-    {
-        if let Some(parent) = dest.parent() {
-            let _ = std::fs::create_dir_all(parent);
-            if std::fs::copy(&src, &dest).is_ok() {
-                let _ = std::process::Command::new("fc-cache")
-                    .args(["-f", parent.to_string_lossy().as_ref()])
-                    .status();
-            }
-        }
-    }
-}
-
-fn apply_hyprbars_button_keywords(bar_rgb: &str, text_rgb: &str, chrome: &WindowChrome) {
-    if let Some(path) = hyprland_conf_path() {
-        if let Ok(text) = std::fs::read_to_string(&path) {
-            let mut any = false;
-            for line in text.lines() {
-                let trimmed = line.trim_start();
-                if let Some(rest) = trimmed.strip_prefix("hyprbars-button") {
-                    let value = rest.trim_start().trim_start_matches('=').trim();
-                    if !value.is_empty() {
-                        hyprctl_keyword("plugin:hyprbars:hyprbars-button", value);
-                        any = true;
-                    }
-                }
-            }
-            if any {
-                return;
-            }
-        }
-    }
-    let size = chrome.buttons.size.to_string();
-    for (icon, action) in [
-        (chrome.buttons.close.as_str(), "hyprctl dispatch killactive"),
-        (
-            chrome.buttons.maximize.as_str(),
-            "hyprctl dispatch fullscreen 1",
-        ),
-        // Decorative only — minimize / special:minimized was removed.
-        (chrome.buttons.minimize.as_str(), "true"),
-    ] {
-        hyprctl_keyword(
-            "plugin:hyprbars:hyprbars-button",
-            &format!("{bar_rgb}, {size}, {icon}, {action}, {text_rgb}"),
-        );
     }
 }
 
@@ -2656,116 +2715,6 @@ fn replace_hypr_assign(text: &str, key: &str, value: &str) -> String {
     out
 }
 
-fn hypr_key_present(text: &str, key: &str) -> bool {
-    let prefix = format!("{key} =");
-    let prefix2 = format!("{key}=");
-    text.lines().any(|line| {
-        let t = line.trim_start();
-        t.starts_with(&prefix) || t.starts_with(&prefix2)
-    })
-}
-
-/// Replace `key =` if present; otherwise insert a line immediately after `after_key`.
-fn replace_or_insert_hypr_assign(text: &str, key: &str, value: &str, after_key: &str) -> String {
-    if hypr_key_present(text, key) {
-        return replace_hypr_assign(text, key, value);
-    }
-    let mut out = String::with_capacity(text.len() + 64);
-    let after = format!("{after_key} =");
-    let after2 = format!("{after_key}=");
-    let mut inserted = false;
-    for line in text.lines() {
-        out.push_str(line);
-        out.push('\n');
-        if inserted {
-            continue;
-        }
-        let trimmed = line.trim_start();
-        if trimmed.starts_with(&after) || trimmed.starts_with(&after2) {
-            let indent_len = line.len() - trimmed.len();
-            out.push_str(&line[..indent_len]);
-            out.push_str(key);
-            out.push_str(" = ");
-            out.push_str(value);
-            out.push('\n');
-            inserted = true;
-        }
-    }
-    if !inserted {
-        out.push_str(key);
-        out.push_str(" = ");
-        out.push_str(value);
-        out.push('\n');
-    }
-    if !text.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
-    }
-    out
-}
-
-fn rewrite_hyprbars_buttons(
-    text: &str,
-    bar_rgb: &str,
-    text_rgb: &str,
-    size: &str,
-    buttons: &ChromeButtons,
-) -> String {
-    let mut out = String::with_capacity(text.len() + 32);
-    for line in text.lines() {
-        if line.trim_start().starts_with("hyprbars-button") {
-            out.push_str(&rewrite_one_hyprbars_button(
-                line, bar_rgb, text_rgb, size, buttons,
-            ));
-            out.push('\n');
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if !text.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
-    }
-    out
-}
-
-fn rewrite_one_hyprbars_button(
-    line: &str,
-    bar_rgb: &str,
-    text_rgb: &str,
-    size: &str,
-    buttons: &ChromeButtons,
-) -> String {
-    let indent_len = line.len() - line.trim_start().len();
-    let indent = &line[..indent_len];
-    let trimmed = line.trim_start();
-    let Some(eq) = trimmed.find('=') else {
-        return line.to_string();
-    };
-    let rest = trimmed[eq + 1..].trim();
-    let commas: Vec<usize> = rest
-        .char_indices()
-        .filter_map(|(i, c)| if c == ',' { Some(i) } else { None })
-        .collect();
-    if commas.len() < 3 {
-        return line.to_string();
-    }
-    let after_icon = rest[commas[2] + 1..].trim();
-    let action = {
-        let lower = after_icon.to_ascii_lowercase();
-        if let Some(idx) = lower
-            .rfind(", rgb(")
-            .or_else(|| lower.rfind(",rgba("))
-            .or_else(|| lower.rfind(",rgb("))
-        {
-            after_icon[..idx].trim()
-        } else {
-            after_icon
-        }
-    };
-    let icon = buttons.glyph_for_action(action);
-    format!("{indent}hyprbars-button = {bar_rgb}, {size}, {icon}, {action}, {text_rgb}")
-}
-
 fn hypr_instance_signature() -> Option<String> {
     if let Ok(sig) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE") {
         if !sig.is_empty() {
@@ -2801,16 +2750,6 @@ fn hyprctl_keyword(key: &str, value: &str) {
     let _ = hyprctl_quiet(hyprctl_cmd().args(["keyword", key, value])).status();
 }
 
-fn hyprctl_dispatch(name: &str, args: &str) {
-    let _ = hyprctl_quiet(hyprctl_cmd().args(["dispatch", name, args])).status();
-}
-
-fn apply_hyprbars_fill(c1: &str, c2: &str, i1: &str, i2: &str, dir: &str) {
-    let args = format!("{c1} {c2} {i1} {i2} {dir}");
-    let _ = hyprctl_quiet(hyprctl_cmd().args(["hyprbarsfill", &args])).status();
-    hyprctl_dispatch("hyprbarsgradient", &args);
-}
-
 #[allow(dead_code)] // kept for session-start safety comments; theme apply must not reload
 fn hyprctl_reload() {
     // Session start sets this so we never `hyprctl reload` while plugins/portals
@@ -2825,33 +2764,305 @@ fn theme_session_safe() -> bool {
     std::env::var_os("HYPRCORE_THEME_NO_HYPR_RELOAD").is_some()
 }
 
-/// True when the Hyprland hyprbars plugin is loaded (titlebar − □ ×).
+/// Hyprbars is not part of this desktop.
 pub fn hyprbars_active() -> bool {
-    if hypr_instance_signature().is_none() {
-        return false;
-    }
-    let Ok(out) = hyprctl_cmd()
-        .args(["plugin", "list"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-    else {
-        return false;
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .to_ascii_lowercase()
-        .contains("plugin hyprbars")
+    false
 }
 
-/// Prefer hiding GTK headerbar close/min/max when hyprbars owns those controls.
+/// Whether to show GTK headerbar window controls.
+///
+/// Always true — suite apps keep an in-header close (X) even when hyprbars is
+/// active, so every window can be dismissed from the top-right of the app chrome.
 pub fn headerbar_show_title_buttons() -> bool {
-    !hyprbars_active()
+    true
 }
 
-/// Apply suite defaults to a headerbar (hide CSD buttons under hyprbars).
+/// Apply suite defaults: show a close button on the right of the headerbar.
 pub fn prepare_headerbar(header: &gtk::HeaderBar) {
-    header.set_show_title_buttons(headerbar_show_title_buttons());
+    header.set_show_title_buttons(true);
+    // Only close — no min/max (hyprbars / WM can still provide those).
+    header.set_decoration_layout(Some(":close"));
+}
+
+/// Left-aligned app brand + hamburger that reveals a horizontal menubar.
+///
+/// The header center shows the open document/media name via
+/// [`RevealMenubar::set_content_title`] — not a second copy of the brand.
+/// Clicking the hamburger shows File / Edit / …; elsewhere / Escape / a
+/// command hides it again.
+#[derive(Clone)]
+pub struct RevealMenubar {
+    /// Left brand label (e.g. "GTK Player") — stays put.
+    pub title: gtk::Label,
+    /// Center content label (open file / image / track). Empty when idle.
+    pub content: gtk::Label,
+    /// Stack swapping ellipsis button ↔ File/Edit menubar (vhomogeneous so
+    /// the header height stays put). Pack via [`RevealMenubar::pack_controls`]
+    /// after permanent toolbar buttons.
+    controls: gtk::Stack,
+    hamburger: gtk::ToggleButton,
+    menubar: gtk::PopoverMenuBar,
+}
+
+impl RevealMenubar {
+    /// Set the left brand label (rarely needed after install).
+    pub fn set_title(&self, text: &str) {
+        self.title.set_text(text);
+    }
+
+    /// Set the center title to the open document/media name.
+    /// Pass `""` to clear (nothing open).
+    pub fn set_content_title(&self, text: &str) {
+        // Keep the widget mapped — hiding it makes HeaderBar fall back to
+        // window.set_title() and duplicates the left brand.
+        self.content.set_text(text.trim());
+    }
+
+    pub fn hide(&self) {
+        self.hamburger.set_active(false);
+    }
+
+    pub fn menubar(&self) -> &gtk::PopoverMenuBar {
+        &self.menubar
+    }
+
+    pub fn hamburger(&self) -> &gtk::ToggleButton {
+        &self.hamburger
+    }
+
+    /// Pack the hamburger / menubar slot at the end of the header start area.
+    /// Call after `header.pack_start` for open/play/nav buttons so those stay
+    /// left of the reveal and do not shift when the menu toggles.
+    pub fn pack_controls(&self, header: &gtk::HeaderBar) {
+        header.pack_start(&self.controls);
+    }
+}
+
+/// CSS-drawn ellipsis (···) — no font dependency.
+pub fn ellipsis_menu_glyph() -> gtk::Box {
+    let glyph = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+    glyph.add_css_class("gtk-reveal-menu-glyph");
+    glyph.set_halign(gtk::Align::Center);
+    glyph.set_valign(gtk::Align::Center);
+    glyph.set_hexpand(false);
+    glyph.set_vexpand(false);
+    for _ in 0..3 {
+        let dot = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        dot.add_css_class("gtk-reveal-menu-dot");
+        glyph.append(&dot);
+    }
+    glyph
+}
+
+fn make_ellipsis_glyph() -> gtk::Box {
+    ellipsis_menu_glyph()
+}
+
+/// Pack a left-aligned brand title onto `header`, and build a revealable
+/// [`gtk::PopoverMenuBar`]. Prefer hierarchical top-level items (File / Edit /
+/// View / Help). Call [`RevealMenubar::pack_controls`] after packing any
+/// permanent toolbar buttons.
+///
+/// `icons`, when provided, is bound into the menubar for custom icon rows.
+pub fn install_reveal_menubar(
+    header: &gtk::HeaderBar,
+    window: &impl IsA<gtk::Widget>,
+    title: &str,
+    menu: &impl IsA<gio::MenuModel>,
+    icons: Option<&IconMenu>,
+) -> RevealMenubar {
+    prepare_headerbar(header);
+
+    let title_label = gtk::Label::builder()
+        .label(title)
+        .css_classes(["title"])
+        .halign(gtk::Align::Start)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+
+    let title_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    title_box.add_css_class("gtk-reveal-title");
+    title_box.set_halign(gtk::Align::Start);
+    title_box.set_valign(gtk::Align::Center);
+    title_box.append(&title_label);
+
+    // CSS ellipsis ··· — Papirus open-menu is vertical dots; unicode tofu's.
+    let hamburger = gtk::ToggleButton::builder()
+        .tooltip_text("Menu")
+        .css_classes(["flat", "gtk-reveal-menu-btn"])
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Center)
+        .build();
+    hamburger.set_child(Some(&make_ellipsis_glyph()));
+
+    let menubar = gtk::PopoverMenuBar::from_model(Some(menu));
+    menubar.add_css_class("gtk-reveal-menubar");
+    menubar.set_halign(gtk::Align::Start);
+    menubar.set_valign(gtk::Align::Center);
+
+    if let Some(icons) = icons {
+        icons.bind_menubar(&menubar);
+    }
+
+    // Stack swap (not set_visible): vhomogeneous keeps header height stable.
+    let controls = gtk::Stack::new();
+    controls.add_css_class("gtk-reveal-controls");
+    controls.set_halign(gtk::Align::Start);
+    controls.set_valign(gtk::Align::Center);
+    controls.set_hhomogeneous(false);
+    controls.set_vhomogeneous(true);
+    controls.set_transition_type(gtk::StackTransitionType::None);
+    controls.set_size_request(-1, 34);
+    controls.add_named(&hamburger, Some("btn"));
+    controls.add_named(&menubar, Some("menu"));
+    controls.set_visible_child_name("btn");
+
+    // Center: open document/media. Always keep a title_widget so HeaderBar
+    // does not mirror window.set_title() as a second brand.
+    let content_label = gtk::Label::builder()
+        .css_classes(["title", "gtk-reveal-content-title"])
+        .halign(gtk::Align::Center)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .build();
+    header.set_title_widget(Some(&content_label));
+    header.pack_start(&title_box);
+
+    {
+        let stack = controls.clone();
+        let menubar = menubar.clone();
+        hamburger.connect_toggled(move |btn| {
+            if btn.is_active() {
+                stack.set_visible_child_name("menu");
+                menubar.grab_focus();
+            } else {
+                stack.set_visible_child_name("btn");
+            }
+        });
+    }
+
+    // Escape closes the revealed bar.
+    {
+        let hamburger = hamburger.clone();
+        let key = gtk::EventControllerKey::new();
+        key.set_propagation_phase(gtk::PropagationPhase::Capture);
+        key.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape && hamburger.is_active() {
+                hamburger.set_active(false);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        window.as_ref().add_controller(key);
+    }
+
+    // Click outside brand / controls / content hides the bar.
+    {
+        let hamburger = hamburger.clone();
+        let controls = controls.clone();
+        let title_box = title_box.clone();
+        let content_label = content_label.clone();
+        let click = gtk::GestureClick::new();
+        click.set_button(1);
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        click.connect_pressed(move |gesture, _, x, y| {
+            if !hamburger.is_active() {
+                return;
+            }
+            let Some(widget) = gesture.widget() else {
+                return;
+            };
+            let Some(target) = widget.pick(x, y, gtk::PickFlags::DEFAULT) else {
+                hamburger.set_active(false);
+                return;
+            };
+            if target == title_box
+                || target.is_ancestor(&title_box)
+                || title_box.is_ancestor(&target)
+                || target == controls
+                || target.is_ancestor(&controls)
+                || controls.is_ancestor(&target)
+                || target == content_label
+                || target.is_ancestor(&content_label)
+                || content_label.is_ancestor(&target)
+            {
+                return;
+            }
+            hamburger.set_active(false);
+        });
+        window.as_ref().add_controller(click);
+    }
+
+    // After a submenu popover closes with nothing else open, hide the bar
+    // (covers activating a command or dismissing a submenu by clicking away).
+    {
+        let hamburger = hamburger.clone();
+        let menubar_watch = menubar.clone();
+        menubar.connect_realize(move |bar| {
+            wire_menubar_popover_autohide(bar, &hamburger);
+            let hamburger = hamburger.clone();
+            bar.connect_map(move |bar| {
+                wire_menubar_popover_autohide(bar, &hamburger);
+            });
+            let _ = &menubar_watch;
+        });
+    }
+
+    RevealMenubar {
+        title: title_label,
+        content: content_label,
+        controls,
+        hamburger,
+        menubar,
+    }
+}
+
+fn wire_menubar_popover_autohide(bar: &gtk::PopoverMenuBar, hamburger: &gtk::ToggleButton) {
+    let mut child = bar.first_child();
+    while let Some(widget) = child {
+        if let Some(btn) = widget.downcast_ref::<gtk::MenuButton>() {
+            if let Some(popover) = btn.popover() {
+                // Skip if we already hooked this popover (realize/map can re-run).
+                if popover.css_classes().iter().any(|c| c == "gtk-reveal-hooked") {
+                    child = widget.next_sibling();
+                    continue;
+                }
+                popover.add_css_class("gtk-reveal-hooked");
+                let hamburger = hamburger.clone();
+                let bar = bar.clone();
+                popover.connect_closed(move |_| {
+                    let hamburger = hamburger.clone();
+                    let bar = bar.clone();
+                    glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
+                        if !hamburger.is_active() {
+                            return;
+                        }
+                        if menubar_has_open_popover(&bar) {
+                            return;
+                        }
+                        hamburger.set_active(false);
+                    });
+                });
+            }
+        }
+        child = widget.next_sibling();
+    }
+}
+
+fn menubar_has_open_popover(bar: &gtk::PopoverMenuBar) -> bool {
+    let mut child = bar.first_child();
+    while let Some(widget) = child {
+        if let Some(btn) = widget.downcast_ref::<gtk::MenuButton>() {
+            if let Some(popover) = btn.popover() {
+                if popover.is_visible() {
+                    return true;
+                }
+            }
+        }
+        child = widget.next_sibling();
+    }
+    false
 }
 
 /// Best-effort: restyle Waybar / mako / fuzzel / Hyprland window borders to the
@@ -2881,7 +3092,12 @@ pub fn sync_shell_chrome(profile: &Profile) {
         chrome.border_size,
         chrome.rounding,
     );
-    if let (Some(active), Some(inactive)) =
+    // Thickness 0 = no visible outline, but keep a 1px transparent hit-target so
+    // resize_on_border / Super+drag still work (Hyprland has no grab without a border).
+    if chrome.border_size == 0 {
+        let clear = "rgba(00000000) rgba(00000000) 0deg";
+        sync_hypr_window_borders(clear, clear, &profile.border_hex());
+    } else if let (Some(active), Some(inactive)) =
         (profile.hypr_active_border(), profile.hypr_inactive_border())
     {
         sync_hypr_window_borders(&active, &inactive, &profile.border_hex());
@@ -2943,36 +3159,27 @@ pub fn sync_desktop_theme(profile: &Profile) {
 /// Live-update the Hyprland window outline from an in-progress editor profile
 /// (hyprctl only; configs are written on Apply via [`sync_shell_chrome`]).
 pub fn preview_window_border(data: &ProfileData) {
-    if let (Some(active), Some(inactive)) = (data.hypr_active_border(), data.hypr_inactive_border())
+    let chrome = data.chrome_or_default();
+    if chrome.border_size == 0 {
+        let clear = "rgba(00000000) rgba(00000000) 0deg";
+        apply_hypr_window_border_keywords(clear, clear);
+    } else if let (Some(active), Some(inactive)) =
+        (data.hypr_active_border(), data.hypr_inactive_border())
     {
         apply_hypr_window_border_keywords(&active, &inactive);
     }
-    let chrome = data.chrome_or_default();
     if !theme_session_safe() {
-        hyprctl_keyword("general:border_size", &chrome.border_size.to_string());
+        let applied = if chrome.border_size == 0 {
+            1
+        } else {
+            chrome.border_size
+        };
+        hyprctl_keyword("general:border_size", &applied.to_string());
         hyprctl_keyword("decoration:rounding", &chrome.rounding.to_string());
-        preview_hyprbars_fill(data, &chrome);
+        hyprctl_keyword("general:resize_on_border", "true");
+        hyprctl_keyword("general:extend_border_grab_area", "20");
+        hyprctl_keyword("general:hover_icon_on_border", "true");
     }
-}
-
-fn preview_hyprbars_fill(data: &ProfileData, chrome: &WindowChrome) {
-    let surface = mix_hex(&data.background, &data.foreground, 0.10);
-    let [b0, b1] = chrome.bar_stops(&surface, &data.foreground);
-    let [i0, i1] = chrome.bar_inactive_stops(&surface, &data.background);
-    let Some(c0) = hex_to_hypr_rgba(&b0, "ff") else {
-        return;
-    };
-    let Some(c1) = hex_to_hypr_rgba(&b1, "ff") else {
-        return;
-    };
-    let Some(ic0) = hex_to_hypr_rgba(&i0, "ff") else {
-        return;
-    };
-    let Some(ic1) = hex_to_hypr_rgba(&i1, "ff") else {
-        return;
-    };
-    hyprctl_keyword("plugin:hyprbars:bar_color", &c0);
-    apply_hyprbars_fill(&c0, &c1, &ic0, &ic1, chrome.gradient.as_id());
 }
 
 fn config_candidates(rel: &str) -> Vec<PathBuf> {
@@ -3365,7 +3572,9 @@ fn sync_hypr_window_borders(active: &str, inactive: &str, panel_hex: &str) {
 }
 
 fn sync_hypr_window_geometry(border_size: u32, rounding: u32) {
-    let size = border_size.to_string();
+    // Visual 0 → invisible 1px border so edge-resize still has a grab surface.
+    let applied = if border_size == 0 { 1 } else { border_size };
+    let size = applied.to_string();
     let round = rounding.to_string();
     for path in hypr_conf_paths() {
         let Ok(original) = std::fs::read_to_string(&path) else {
@@ -3374,6 +3583,9 @@ fn sync_hypr_window_geometry(border_size: u32, rounding: u32) {
         let mut out = original.clone();
         out = replace_hypr_assign(&out, "border_size", &size);
         out = replace_hypr_assign(&out, "rounding", &round);
+        out = replace_hypr_assign(&out, "resize_on_border", "true");
+        out = replace_hypr_assign(&out, "extend_border_grab_area", "20");
+        out = replace_hypr_assign(&out, "hover_icon_on_border", "true");
         if out != original {
             let _ = std::fs::write(&path, out);
         }
@@ -3381,6 +3593,9 @@ fn sync_hypr_window_geometry(border_size: u32, rounding: u32) {
     if !theme_session_safe() {
         hyprctl_keyword("general:border_size", &size);
         hyprctl_keyword("decoration:rounding", &round);
+        hyprctl_keyword("general:resize_on_border", "true");
+        hyprctl_keyword("general:extend_border_grab_area", "20");
+        hyprctl_keyword("general:hover_icon_on_border", "true");
     }
 }
 
