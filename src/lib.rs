@@ -2488,7 +2488,7 @@ pub fn profile_id_at(ids: &[&'static str], selected: u32) -> Option<&'static str
     ids.get(selected as usize).copied()
 }
 
-/// Best-effort: rewrite hyprbars colors in `~/.config/hypr/hyprland.conf` to
+/// Best-effort: rewrite hyprbars/hyprtabs colors in `~/.config/hypr/hyprland.lua` to
 /// match this profile (bar = elevated surface, text/glyphs = foreground), then
 /// push live via `hyprctl keyword`. No-op outside Hyprland.
 /// Does not `hyprctl reload` — that re-runs monitor= and rearranges displays.
@@ -4434,39 +4434,57 @@ fn sync_hypr_gtk_theme_env(is_dark: bool) {
         ("GTK_ICON_THEME", icons),
         ("XDG_ICON_THEME", icons),
     ];
-    for path in config_candidates("hypr/hyprland.conf") {
-        if !path.is_file() {
-            continue;
-        }
-        let Ok(original) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let mut changed = false;
-        let mut lines = Vec::new();
-        for line in original.lines() {
-            let trimmed = line.trim_start();
-            let mut replaced = false;
-            if trimmed.starts_with("env") {
-                for (key, value) in replacements {
-                    let needle = format!("{key},");
-                    if trimmed.contains(&needle) {
-                        lines.push(format!("env = {key},{value}"));
-                        changed = true;
-                        replaced = true;
-                        break;
+    let mut seen = std::collections::HashSet::new();
+    for rel in ["hypr/hyprland.lua", "hypr/hyprland.conf"] {
+        for path in config_candidates(rel) {
+            if !path.is_file() {
+                continue;
+            }
+            let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+            let Ok(original) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let is_lua = path.extension().and_then(|e| e.to_str()) == Some("lua");
+            let mut changed = false;
+            let mut lines = Vec::new();
+            for line in original.lines() {
+                let trimmed = line.trim_start();
+                let mut replaced = false;
+                if is_lua && trimmed.starts_with("hl.env(") {
+                    for (key, value) in replacements {
+                        let needle = format!("hl.env(\"{key}\"");
+                        if trimmed.starts_with(&needle) {
+                            lines.push(format!("hl.env(\"{key}\", \"{value}\")"));
+                            changed = true;
+                            replaced = true;
+                            break;
+                        }
+                    }
+                } else if !is_lua && trimmed.starts_with("env") {
+                    for (key, value) in replacements {
+                        let needle = format!("{key},");
+                        if trimmed.contains(&needle) {
+                            lines.push(format!("env = {key},{value}"));
+                            changed = true;
+                            replaced = true;
+                            break;
+                        }
                     }
                 }
+                if !replaced {
+                    lines.push(line.to_string());
+                }
             }
-            if !replaced {
-                lines.push(line.to_string());
+            if changed {
+                let mut out = lines.join("\n");
+                if original.ends_with('\n') {
+                    out.push('\n');
+                }
+                let _ = std::fs::write(&path, out);
             }
-        }
-        if changed {
-            let mut out = lines.join("\n");
-            if original.ends_with('\n') {
-                out.push('\n');
-            }
-            let _ = std::fs::write(&path, out);
         }
     }
     std::env::set_var("GTK_THEME", SHELL_GTK_THEME);

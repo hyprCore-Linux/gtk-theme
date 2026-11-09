@@ -1953,17 +1953,33 @@ def _sync_hypr_gtk_theme_env(is_dark: bool = True) -> None:
         "GTK_ICON_THEME": icons,
         "XDG_ICON_THEME": icons,
     }
-    for path in _config_candidates("hypr/hyprland.conf"):
-        if not path.is_file():
+    candidates = []
+    for rel in ("hypr/hyprland.lua", "hypr/hyprland.conf"):
+        candidates.extend(_config_candidates(rel))
+    seen: set[Path] = set()
+    for path in candidates:
+        try:
+            key = path.resolve()
+        except OSError:
+            key = path
+        if key in seen or not path.is_file():
             continue
+        seen.add(key)
         try:
             original = path.read_text(encoding="utf-8")
         except OSError:
             continue
         updated = original
         for key, value in replacements.items():
-            needle = re.compile(rf"^env\s*=\s*{re.escape(key)}\s*,\s*.+$", re.MULTILINE)
-            line = f"env = {key},{value}"
+            if path.suffix == ".lua":
+                needle = re.compile(
+                    rf'^hl\.env\("{re.escape(key)}",\s*"[^"]*"\)\s*$',
+                    re.MULTILINE,
+                )
+                line = f'hl.env("{key}", "{value}")'
+            else:
+                needle = re.compile(rf"^env\s*=\s*{re.escape(key)}\s*,\s*.+$", re.MULTILINE)
+                line = f"env = {key},{value}"
             if needle.search(updated):
                 updated = needle.sub(line, updated)
         if updated != original:
