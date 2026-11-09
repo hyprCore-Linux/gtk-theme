@@ -2494,18 +2494,13 @@ pub fn profile_id_at(ids: &[&'static str], selected: u32) -> Option<&'static str
 /// Does not `hyprctl reload` — that re-runs monitor= and rearranges displays.
 pub fn sync_hyprbars(profile: &Profile) {
     // Hyprbars is not used. The name remains so existing callers still refresh tabs.
-    let _ = sync_hyprtabs(profile);
+    // hyprtabs plugin removed
 }
 
 /// Push GTK suite colors into `plugin:hyprtabs` (capsule, text, active pill).
-pub fn sync_hyprtabs(profile: &Profile) -> bool {
-    let chrome = profile.window_chrome();
-    sync_hyprtabs_chrome(
-        &profile.surface_hex(),
-        profile.background,
-        profile.foreground,
-        &chrome,
-    )
+pub fn sync_hyprtabs(_profile: &Profile) -> bool {
+    // hyprtabs plugin removed
+    true
 }
 
 fn sync_hyprtabs_chrome(
