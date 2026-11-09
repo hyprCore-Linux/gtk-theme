@@ -2573,16 +2573,38 @@ fn sync_hyprtabs_chrome(
 }
 
 fn rewrite_hyprtabs_assigns(text: &str, assigns: &[(&str, &str)]) -> String {
+    let lua = text.contains("hl.plugin.hyprtabs");
     let mut out = String::new();
     let mut in_tabs = false;
     let mut depth: i32 = 0;
     let mut seen: Vec<&str> = Vec::new();
-    let mut insert_indent = "        ".to_string();
+    let mut insert_indent = if lua {
+        "    ".to_string()
+    } else {
+        "        ".to_string()
+    };
+
+    let fmt = |key: &str, value: &str| -> String {
+        if !lua {
+            return format!("{key} = {value}");
+        }
+        if key.contains('.') {
+            format!("[\"{key}\"] = \"{value}\"")
+        } else {
+            format!("{key} = \"{value}\"")
+        }
+    };
+
     for line in text.lines() {
         let trimmed = line.trim_start();
         let indent_len = line.len() - trimmed.len();
         let indent = &line[..indent_len];
-        if !in_tabs && trimmed.starts_with("hyprtabs") {
+        let start = if lua {
+            trimmed.starts_with("hl.plugin.hyprtabs")
+        } else {
+            trimmed.starts_with("hyprtabs")
+        };
+        if !in_tabs && start {
             in_tabs = true;
             depth = 0;
             seen.clear();
@@ -2597,9 +2619,7 @@ fn rewrite_hyprtabs_assigns(text: &str, assigns: &[(&str, &str)]) -> String {
                 for (key, value) in assigns {
                     if !seen.iter().any(|s| s == key) {
                         out.push_str(&insert_indent);
-                        out.push_str(key);
-                        out.push_str(" = ");
-                        out.push_str(value);
+                        out.push_str(&fmt(key, value));
                         out.push('\n');
                     }
                 }
@@ -2610,12 +2630,15 @@ fn rewrite_hyprtabs_assigns(text: &str, assigns: &[(&str, &str)]) -> String {
             }
             let mut replaced = false;
             for (key, value) in assigns {
-                if trimmed.starts_with(&format!("{key} =")) || trimmed.starts_with(&format!("{key}="))
-                {
+                let hit = if lua && key.contains('.') {
+                    trimmed.starts_with(&format!("[\"{key}\"]"))
+                } else {
+                    trimmed.starts_with(&format!("{key} ="))
+                        || trimmed.starts_with(&format!("{key}="))
+                };
+                if hit {
                     out.push_str(indent);
-                    out.push_str(key);
-                    out.push_str(" = ");
-                    out.push_str(value);
+                    out.push_str(&fmt(key, value));
                     out.push('\n');
                     if !seen.iter().any(|s| s == key) {
                         seen.push(*key);
@@ -2657,13 +2680,20 @@ fn chrome_bar_font(chrome: &WindowChrome) -> &'static str {
 }
 
 fn hyprland_conf_path() -> Option<PathBuf> {
-    hypr_conf_paths()
-        .into_iter()
-        .find(|p| p.file_name().is_some_and(|n| n == "hyprland.conf"))
+    // Prefer Lua (Hyprland 0.55+); fall back to legacy .conf.
+    let paths = hypr_conf_paths();
+    paths
+        .iter()
+        .find(|p| p.file_name().is_some_and(|n| n == "hyprland.lua"))
+        .cloned()
+        .or_else(|| {
+            paths
+                .into_iter()
+                .find(|p| p.file_name().is_some_and(|n| n == "hyprland.conf"))
+        })
 }
 
-/// `hyprland.conf` plus `binds-personal.conf` (this workstation's 10px outline
-/// lives in the latter and would otherwise override the base file).
+/// `hyprland.lua` / `.conf` (+ personal binds). Lua wins when both exist.
 fn hypr_conf_paths() -> Vec<PathBuf> {
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -2672,7 +2702,12 @@ fn hypr_conf_paths() -> Vec<PathBuf> {
         dirs::home_dir().map(|d| d.join("configs/hypr")),
     ];
     for dir in dirs.into_iter().flatten() {
-        for name in ["hyprland.conf", "binds-personal.conf"] {
+        for name in [
+            "hyprland.lua",
+            "hyprland.conf",
+            "binds-personal.lua",
+            "binds-personal.conf",
+        ] {
             let path = dir.join(name);
             if !path.is_file() {
                 continue;
@@ -3605,13 +3640,21 @@ fn sync_hypr_workspace_background(bg: &str) {
     };
     let mut wrote = false;
     for path in hypr_conf_paths() {
-        if path.file_name().is_none_or(|n| n != "hyprland.conf") {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name != "hyprland.lua" && name != "hyprland.conf" {
             continue;
         }
         let Ok(original) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let out = replace_hypr_assign(&original, "background_color", &rgb);
+        let value = if name.ends_with(".lua") {
+            format!("\"{rgb}\"")
+        } else {
+            rgb.clone()
+        };
+        let out = replace_hypr_assign(&original, "background_color", &value);
         if out != original {
             if std::fs::write(&path, out).is_ok() {
                 wrote = true;

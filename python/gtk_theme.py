@@ -971,18 +971,43 @@ def sync_hyprtabs_colors(
 
 
 def _rewrite_hyprtabs_assigns(text: str, assigns: dict[str, str]) -> str:
-    """Set keys only inside the `hyprtabs { ... }` plugin block."""
+    """Set keys inside `hyprtabs { ... }` (.conf) or `hl.plugin.hyprtabs = { ... }` (.lua)."""
+    lua = "hl.plugin.hyprtabs" in text
     lines = text.splitlines(keepends=True)
     out: list[str] = []
     in_tabs = False
     depth = 0
     seen: set[str] = set()
-    insert_indent = "        "
+    insert_indent = "    " if lua else "        "
+
+    def _fmt(key: str, value: str) -> str:
+        if not lua:
+            return f"{key} = {value}"
+        # Lua string values; dotted keys need bracket form.
+        if "." in key:
+            return f'["{key}"] = "{value}"'
+        return f'{key} = "{value}"'
+
+    def _line_key(trimmed: str) -> str | None:
+        for key in assigns:
+            if lua and "." in key:
+                pref = f'["{key}"]'
+                if trimmed.startswith(pref):
+                    return key
+            if trimmed.startswith(f"{key} =") or trimmed.startswith(f"{key}="):
+                return key
+        return None
+
     for line in lines:
         bare = line.rstrip("\r\n")
         trimmed = bare.lstrip()
         indent = bare[: len(bare) - len(trimmed)]
-        if not in_tabs and trimmed.startswith("hyprtabs"):
+        start = (
+            trimmed.startswith("hl.plugin.hyprtabs")
+            if lua
+            else trimmed.startswith("hyprtabs")
+        )
+        if not in_tabs and start:
             in_tabs = True
             depth = 0
             seen = set()
@@ -993,24 +1018,20 @@ def _rewrite_hyprtabs_assigns(text: str, assigns: dict[str, str]) -> str:
         if in_tabs:
             depth += trimmed.count("{") - trimmed.count("}")
             if depth <= 0:
-                # Closing brace of hyprtabs — insert any missing keys first.
                 nl = line[len(bare) :] or "\n"
                 for key, value in assigns.items():
                     if key not in seen:
-                        out.append(f"{insert_indent}{key} = {value}{nl}")
+                        out.append(f"{insert_indent}{_fmt(key, value)}{nl}")
                 in_tabs = False
                 out.append(line)
                 continue
-            replaced = False
-            for key, value in assigns.items():
-                if trimmed.startswith(f"{key} =") or trimmed.startswith(f"{key}="):
-                    nl = line[len(bare) :] or "\n"
-                    out.append(f"{indent}{key} = {value}{nl}")
-                    seen.add(key)
-                    insert_indent = indent or insert_indent
-                    replaced = True
-                    break
-            if not replaced:
+            key = _line_key(trimmed)
+            if key is not None:
+                nl = line[len(bare) :] or "\n"
+                out.append(f"{indent}{_fmt(key, assigns[key])}{nl}")
+                seen.add(key)
+                insert_indent = indent or insert_indent
+            else:
                 out.append(line)
             continue
         out.append(line)
@@ -1029,6 +1050,10 @@ def _chrome_bar_font(chrome: WindowChrome) -> str:
 
 
 def _hyprland_conf_path() -> Optional[Path]:
+    # Prefer Lua (Hyprland 0.55+); fall back to legacy .conf.
+    for path in _hypr_conf_paths():
+        if path.name == "hyprland.lua":
+            return path
     for path in _hypr_conf_paths():
         if path.name == "hyprland.conf":
             return path
@@ -1040,7 +1065,7 @@ def _hypr_conf_paths() -> list[Path]:
     seen: set[Path] = set()
     out: list[Path] = []
     for folder in (xdg / "hypr", Path.home() / "configs" / "hypr"):
-        for name in ("hyprland.conf", "binds-personal.conf"):
+        for name in ("hyprland.lua", "hyprland.conf", "binds-personal.lua", "binds-personal.conf"):
             cand = folder / name
             if not cand.is_file():
                 continue
@@ -2470,13 +2495,14 @@ def _sync_hypr_workspace_background(bg: str) -> None:
         return
     wrote = False
     for path in _hypr_conf_paths():
-        if path.name != "hyprland.conf":
+        if path.name not in ("hyprland.lua", "hyprland.conf"):
             continue
         try:
             original = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        out = _replace_hypr_assign(original, "background_color", rgb)
+        value = f'"{rgb}"' if path.suffix == ".lua" else rgb
+        out = _replace_hypr_assign(original, "background_color", value)
         if out != original:
             try:
                 path.write_text(out, encoding="utf-8")
